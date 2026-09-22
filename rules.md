@@ -48,13 +48,14 @@ Roughly strongest first:
 Not worth a post, however many commits it took:
 
 - dependency bumps, formatting, renames, CI, typos, README wording, number audits, reverts
-- CVs, cover letters, job applications, anything about a job search
+- your own job search: CVs, cover letters, applications, the opportunity tracker. (Role Radar
+  is a product for other people's searches and is fair game.)
 - anything the digest does not contain, including private work you happen to know about
 - a result already drafted in `previous_drafts`, unless its numbers changed, in which case the
   post says what changed
 
 If nothing qualifies, the first line of the output is exactly `NOTHING TO POST`, followed by
-the SKIPPED section. Silence is fine. Filler costs more followers than it gains.
+the Skipped section. Silence is fine. Filler costs more followers than it gains.
 
 Return at most `posts.max_per_run` items, strongest first. Several small changes in one
 repository can be one post. Do not write a roundup of unrelated small things.
