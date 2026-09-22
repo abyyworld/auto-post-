@@ -1,0 +1,66 @@
+{
+  "version": 1,
+  "about": "Single source of truth for the post scanner. Who you are, which repositories count, the facts every post must agree with, and the shape of each platform. scan.py reads the scan block; rules.md describes the procedure and repeats none of this data.",
+
+  "person": {
+    "name": "Akbar Juraev",
+    "github": "abyyworld",
+    "headline": "Robotics & Software Engineer, Human-AI Interaction Researcher @ University of Birmingham",
+    "links": {
+      "site": "https://www.akbarjuraev.com",
+      "github": "https://github.com/abyyworld",
+      "linkedin": "https://www.linkedin.com/in/akbarjuraev/",
+      "x": "https://x.com/theakbarjuraev"
+    },
+    "audience": "robotics, ML and software engineering recruiters and engineers, plus HCI and VR researchers"
+  },
+
+  "scan": {
+    "public_only": true,
+    "include_forks": false,
+    "include_archived": false,
+    "exclude_repos": ["auto-post-", "abyyworld"],
+    "ignore_authors": ["github-actions[bot]", "dependabot[bot]", "renovate[bot]", "web-flow"],
+    "start_from": "2026-09-22T20:00:00Z",
+    "max_commits_per_repo": 40,
+    "readme_chars": 6000,
+    "previous_drafts": 2,
+    "previous_draft_chars": 6000
+  },
+
+  "issue": {
+    "repo": "abyyworld/auto-post-",
+    "label": "post-drafts",
+    "title_prefix": "Post drafts"
+  },
+
+  "posts": {
+    "max_per_run": 3,
+    "primary": "x",
+    "platforms": {
+      "x": {
+        "max_chars": 280,
+        "thread_max_posts": 5,
+        "hashtags_max": 0,
+        "link_in_reply": true,
+        "also_fits": ["Bluesky, 300 characters", "Threads, 500 characters", "Mastodon, 500 characters"]
+      },
+      "linkedin": {
+        "only_for": "milestones",
+        "max_per_run": 1,
+        "max_chars": 3000,
+        "target_words": [60, 200],
+        "hashtags_max": 3
+      }
+    }
+  },
+
+  "facts": [
+    "One paper under review: AgenticXR, IEEE VR 2027, co-author.",
+    "Omni-Connect: first author, in preparation for ACM UIST 2027. Never write CHI.",
+    "Degree: BSc Artificial Intelligence and Computer Science, University of Birmingham, First Class predicted.",
+    "Drone EduTrain: Robotics & Software Engineer, venture-backed, won UzCombinator Season 2. Never give a funding figure.",
+    "Role Radar (repository internship-tracker) covers 964 company boards.",
+    "Cicatrixa (cicatrixa.com): founder. A live service that repairs its own production crashes."
+  ]
+}

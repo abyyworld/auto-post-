@@ -1,0 +1,99 @@
+# Post drafts, three times a week.
+#
+# Runs on GitHub's infrastructure rather than any AI vendor's, so the schedule survives
+# switching model providers. Swapping provider means editing draft.py, not this file.
+#
+# Setup, once:
+#   Settings > Secrets and variables > Actions > New repository secret
+#   Name: ANTHROPIC_API_KEY
+#
+# Without the secret the job still runs and still opens the issue, carrying the list of
+# what changed alone. That half is deterministic and needs no model.
+#
+# Optional: a SCAN_TOKEN secret (a fine-grained token with read-only Contents and Metadata)
+# lets scan.py see private repositories, but only once scan.public_only is false in
+# config.json. The default token already reads every public repository.
+
+name: Post drafts
+
+on:
+  schedule:
+    # 07:30 UTC on Monday, Wednesday and Friday: 08:30 in Birmingham through the summer and
+    # 07:30 in winter. GitHub cron is always UTC and scheduled runs can start a few minutes late.
+    - cron: "30 7 * * 1,3,5"
+  workflow_dispatch:
+    inputs:
+      since:
+        description: "Start the window here instead, ISO 8601, e.g. 2026-09-15T00:00:00Z (optional)"
+        required: false
+
+permissions:
+  contents: read
+  issues: write
+
+concurrency:
+  group: post-drafts
+  cancel-in-progress: false
+
+jobs:
+  drafts:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Check the scanner still agrees with its tests
+        run: python3 scan.py selftest
+
+      - name: Scan the public repositories
+        id: scan
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          SCAN_TOKEN: ${{ secrets.SCAN_TOKEN }}
+          SINCE: ${{ inputs.since }}
+        run: |
+          set -euo pipefail
+          python3 scan.py scan --json --out digest.json ${SINCE:+--since "$SINCE"} > /dev/null
+          python3 scan.py render digest.json
+          echo "changes=$(jq -r .has_changes digest.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Write the drafts
+        id: drafts
+        if: steps.scan.outputs.changes == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -n "${ANTHROPIC_API_KEY:-}" ]; then
+            python3 -m pip install --quiet --disable-pip-version-check anthropic
+            python3 draft.py digest.json > raw.md
+            python3 scan.py check raw.md > drafts.md
+          else
+            : > drafts.md
+          fi
+          if head -n 1 drafts.md | grep -q '^NOTHING TO POST'; then
+            echo "Nothing worth a post. No issue opened; the next run looks at this window again."
+            cat drafts.md
+            echo "post=false" >> "$GITHUB_OUTPUT"
+          else
+            echo "post=true" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Open the drafts as an issue
+        if: steps.drafts.outputs.post == 'true'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          label="$(jq -r .issue.label config.json)"
+          title="$(jq -r .issue.title_prefix config.json) $(date -u +%Y-%m-%d)"
+          gh label create "$label" --color 1D9BF0 --description "Opened by the post drafts workflow" --force
+          python3 scan.py compose digest.json --drafts drafts.md > body.md
+          gh issue create \
+            --title "$title" \
+            --label "$label" \
+            --body-file body.md \
+            --assignee "${{ github.repository_owner }}"

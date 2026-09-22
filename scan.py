@@ -1,0 +1,754 @@
+#!/usr/bin/env python3
+"""
+Post scanner: the deterministic half.
+
+Works out what changed across your public GitHub repositories since the last batch of
+post drafts, and hands that over as a digest. Everything a model gets quietly wrong
+(which window to look at, which commits are new, which are bots or merges, which
+repositories are private) happens here, in code, with a self test. The model's only
+job is judgement: whether any of it is worth a post, and how to say it.
+
+Standard library only, so any machine with Python 3 can run it.
+
+    python3 scan.py since                  when the current window starts, and why
+    python3 scan.py scan                   human readable digest of what changed
+    python3 scan.py scan --json --out digest.json
+    python3 scan.py scan --since 2026-09-15T00:00:00Z
+    python3 scan.py render digest.json     print a saved digest as Markdown
+    python3 scan.py compose digest.json --drafts drafts.md
+                                           the issue body: state marker, drafts, digest
+    python3 scan.py check drafts.md        measure every X post, flag any over the limit
+    python3 scan.py selftest               run the built in tests
+
+How "new" is decided. Every drafts issue carries a hidden marker with the time of its
+scan and the head commit of each repository's default branch. The next scan compares
+each repository from that head to the current one, so a branch merged days after its
+commits were written still shows up. With no marker to go on (the first run, or a head
+that was rewritten away) it falls back to commits dated inside the window. The window
+never starts before scan.start_from in config.json.
+
+No state is committed anywhere: the issues are the log.
+
+Authentication comes from the environment. SCAN_TOKEN is used when set, otherwise
+GITHUB_TOKEN, otherwise no token at all (60 requests an hour, enough for a small run).
+"""
+
+import argparse
+import json
+import os
+import re
+import sys
+import urllib.error
+import urllib.parse
+import urllib.request
+from datetime import datetime, timezone
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+DEFAULT_CONFIG = HERE / "config.json"
+API = "https://api.github.com"
+TRUNCATED = "\n\n[truncated]"
+MARKER = re.compile(r"<!-- auto-post-state (\{.*?\}) -->", re.DOTALL)
+ISSUE_LIMIT = 60000  # GitHub refuses issue bodies over 65536 characters
+
+
+# ----------------------------------------------------------------- small helpers
+
+def parse_time(value):
+    """GitHub timestamps end in Z, which fromisoformat only accepts from Python 3.11."""
+    if not value:
+        return None
+    text = value.strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    moment = datetime.fromisoformat(text)
+    if moment.tzinfo is None:
+        moment = moment.replace(tzinfo=timezone.utc)
+    return moment.astimezone(timezone.utc)
+
+
+def format_time(moment):
+    return moment.astimezone(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def clip(text, limit):
+    """Cut text to limit characters and say so, rather than dropping the end silently."""
+    text = (text or "").strip()
+    if limit is not None and len(text) > limit:
+        return text[:limit].rstrip() + TRUNCATED
+    return text
+
+
+def plural(count, word):
+    return "%d %s%s" % (count, word, "" if count == 1 else "s")
+
+
+def load_config(path=DEFAULT_CONFIG):
+    return json.loads(Path(path).read_text(encoding="utf-8"))
+
+
+# ----------------------------------------------------------------- GitHub access
+
+class GitHub:
+    """The handful of GET requests the scan needs, and nothing else."""
+
+    def __init__(self, token=None):
+        self.token = token
+
+    def _request(self, path, params=None, accept="application/vnd.github+json"):
+        url = path if path.startswith("http") else API + path
+        if params:
+            url += "?" + urllib.parse.urlencode(params)
+        headers = {
+            "Accept": accept,
+            "User-Agent": "auto-post-scanner",
+            "X-GitHub-Api-Version": "2022-11-28",
+        }
+        if self.token:
+            headers["Authorization"] = "Bearer " + self.token
+        request = urllib.request.Request(url, headers=headers)
+        with urllib.request.urlopen(request, timeout=30) as response:
+            return response.read().decode("utf-8"), response.headers.get("Link", "")
+
+    def get(self, path, params=None, missing=None):
+        """One page of JSON. A 404, or a 409 from an empty repository, returns missing."""
+        try:
+            body, _ = self._request(path, params)
+        except urllib.error.HTTPError as error:
+            if error.code in (404, 409):
+                return missing
+            raise
+        return json.loads(body)
+
+    def get_all(self, path, params=None):
+        """Every page, following the Link header."""
+        items, url, query = [], path, dict(params or {}, per_page=100)
+        while url:
+            body, link = self._request(url, query)
+            items.extend(json.loads(body))
+            url, query = next_link(link), None
+        return items
+
+    def readme(self, owner, repo):
+        try:
+            body, _ = self._request("/repos/%s/%s/readme" % (owner, repo),
+                                    accept="application/vnd.github.raw+json")
+        except urllib.error.HTTPError as error:
+            if error.code == 404:
+                return ""
+            raise
+        return body
+
+
+def next_link(header):
+    for part in (header or "").split(","):
+        section = part.split(";")
+        if len(section) > 1 and section[1].strip() == 'rel="next"':
+            return section[0].strip()[1:-1]
+    return None
+
+
+def token_from_env():
+    return os.environ.get("SCAN_TOKEN") or os.environ.get("GITHUB_TOKEN") or None
+
+
+# ----------------------------------------------------------------- previous runs
+
+def draft_issues(issues):
+    """Issues only: the issues endpoint also returns pull requests."""
+    return [issue for issue in issues or [] if "pull_request" not in issue]
+
+
+def read_marker(body):
+    """The state a previous run left in its issue, or {} if it is missing or mangled."""
+    found = MARKER.search(body or "")
+    if not found:
+        return {}
+    try:
+        state = json.loads(found.group(1))
+    except ValueError:
+        return {}
+    return state if isinstance(state, dict) else {}
+
+
+def write_marker(state):
+    return "<!-- auto-post-state %s -->" % json.dumps(state, sort_keys=True, separators=(",", ":"))
+
+
+def resolve_since(config, issues, override=None):
+    """Return (moment, reason). The window never starts before scan.start_from.
+
+    The newest drafts issue decides. Its marker records when its scan ran, which is
+    a minute or so before the issue was opened, so the marker is preferred and the
+    issue's own creation time is the fallback.
+    """
+    if override:
+        return parse_time(override), "given on the command line"
+
+    floor = parse_time(config["scan"]["start_from"])
+    issues = draft_issues(issues)
+    if issues:
+        latest = max(issues, key=lambda issue: parse_time(issue["created_at"]))
+        until = parse_time(read_marker(latest.get("body")).get("until") or latest["created_at"])
+        if until > floor:
+            return until, "last '%s' issue" % config["issue"]["label"]
+    return floor, "scan.start_from in config.json"
+
+
+def previous_heads(issues):
+    """Head commits the newest issue recorded, by repository name."""
+    issues = draft_issues(issues)
+    if not issues:
+        return {}
+    latest = max(issues, key=lambda issue: parse_time(issue["created_at"]))
+    heads = read_marker(latest.get("body")).get("heads") or {}
+    return {name: sha for name, sha in heads.items() if isinstance(sha, str)}
+
+
+def fetch_draft_issues(github, config, count):
+    return draft_issues(github.get("/repos/%s/issues" % config["issue"]["repo"], {
+        "labels": config["issue"]["label"],
+        "state": "all",
+        "sort": "created",
+        "direction": "desc",
+        "per_page": max(count, 1),
+    }, missing=[]))
+
+
+# ----------------------------------------------------------------- selection
+
+def eligible_repos(repos, config):
+    """Every repository the scan may talk about. Returns (eligible, skipped counts)."""
+    scan = config["scan"]
+    excluded = {name.lower() for name in scan["exclude_repos"]}
+    owner = config["person"]["github"].lower()
+    skipped = {"private": 0, "fork": 0, "archived": 0, "excluded": 0}
+    eligible = []
+
+    for repo in repos:
+        if (repo.get("owner") or {}).get("login", "").lower() != owner:
+            continue
+        if scan["public_only"] and repo.get("private"):
+            skipped["private"] += 1
+        elif repo.get("fork") and not scan["include_forks"]:
+            skipped["fork"] += 1
+        elif repo.get("archived") and not scan["include_archived"]:
+            skipped["archived"] += 1
+        elif repo["name"].lower() in excluded:
+            skipped["excluded"] += 1
+        else:
+            eligible.append(repo)
+
+    eligible.sort(key=lambda repo: repo.get("pushed_at") or "", reverse=True)
+    return eligible, skipped
+
+
+def touched_since(repo, since):
+    """pushed_at moves on a push to any branch, so it is a safe first filter."""
+    moments = [parse_time(repo.get(key)) for key in ("pushed_at", "created_at")]
+    moments = [moment for moment in moments if moment]
+    return not moments or max(moments) >= since
+
+
+def keep_commit(commit, ignore_authors):
+    """Drop merges and anything a bot wrote. A commit with no linked account is kept."""
+    if len(commit.get("parents") or []) > 1:
+        return False
+    ignored = {name.lower() for name in ignore_authors}
+    login = ((commit.get("author") or {}).get("login") or "").lower()
+    name = (((commit.get("commit") or {}).get("author") or {}).get("name") or "").lower()
+    if login in ignored or name in ignored:
+        return False
+    return not (login.endswith("[bot]") or name.endswith("[bot]"))
+
+
+def summarise_commit(commit):
+    message = ((commit.get("commit") or {}).get("message") or "").strip()
+    subject, _, body = message.partition("\n")
+    return {
+        "sha": commit["sha"][:7],
+        "date": ((commit.get("commit") or {}).get("author") or {}).get("date"),
+        "subject": subject.strip(),
+        "body": clip(body, 600),
+        "url": commit.get("html_url"),
+    }
+
+
+# ----------------------------------------------------------------- one repository
+
+def current_head(github, repo):
+    latest = github.get("/repos/%s/commits" % repo["full_name"],
+                        {"sha": repo["default_branch"], "per_page": 1}, missing=[])
+    return latest[0]["sha"] if latest else None
+
+
+def new_commits(github, repo, since, previous):
+    """Return (commits newest first, head sha, how they were found).
+
+    From the previous head when there is one and it is still an ancestor of the
+    branch. Otherwise, commits dated inside the window.
+    """
+    if previous:
+        compared = github.get("/repos/%s/compare/%s...%s"
+                              % (repo["full_name"], previous, repo["default_branch"]))
+        if compared and compared.get("status") in ("ahead", "identical"):
+            commits = list(reversed(compared.get("commits") or []))
+            return commits, (commits[0]["sha"] if commits else previous), "since last head"
+
+    commits = github.get("/repos/%s/commits" % repo["full_name"], {
+        "sha": repo["default_branch"],
+        "since": format_time(since),
+        "per_page": 100,
+    }, missing=[]) or []
+    head = commits[0]["sha"] if commits else current_head(github, repo)
+    return commits, head, "dated in window"
+
+
+def repo_changes(github, repo, config, since, previous):
+    """Return (what happened in the window or None, the head to remember)."""
+    scan = config["scan"]
+    limit = scan["max_commits_per_repo"]
+    raw, head, method = new_commits(github, repo, since, previous)
+    kept = [summarise_commit(c) for c in raw if keep_commit(c, scan["ignore_authors"])]
+
+    releases = []
+    for release in github.get("/repos/%s/releases" % repo["full_name"],
+                              {"per_page": 10}, missing=[]) or []:
+        published = parse_time(release.get("published_at"))
+        if release.get("draft") or not published or published < since:
+            continue
+        releases.append({
+            "tag": release.get("tag_name"),
+            "name": release.get("name") or release.get("tag_name"),
+            "published_at": release.get("published_at"),
+            "body": clip(release.get("body"), 2000),
+            "url": release.get("html_url"),
+        })
+
+    is_new = (parse_time(repo.get("created_at")) or since) >= since
+    if not kept and not releases and not is_new:
+        return None, head
+
+    return {
+        "name": repo["name"],
+        "url": repo.get("html_url"),
+        "description": repo.get("description") or "",
+        "homepage": repo.get("homepage") or "",
+        "language": repo.get("language") or "",
+        "topics": repo.get("topics") or [],
+        "stars": repo.get("stargazers_count", 0),
+        "created_at": repo.get("created_at"),
+        "pushed_at": repo.get("pushed_at"),
+        "is_new": is_new,
+        "found_by": method,
+        "commit_count": len(kept),
+        "commits_capped": len(kept) > limit,
+        "commits": kept[:limit],
+        "releases": releases,
+        "readme": clip(github.readme(repo["owner"]["login"], repo["name"]), scan["readme_chars"]),
+    }, head
+
+
+# ----------------------------------------------------------------- the digest
+
+def list_repos(github, config):
+    if not config["scan"]["public_only"] and os.environ.get("SCAN_TOKEN"):
+        return github.get_all("/user/repos", {"affiliation": "owner", "visibility": "all"})
+    return github.get_all("/users/%s/repos" % config["person"]["github"], {"type": "owner"})
+
+
+def build_digest(github, config, override=None, now=None):
+    now = now or datetime.now(timezone.utc)
+    scan = config["scan"]
+    issues = fetch_draft_issues(github, config, scan["previous_drafts"])
+    since, reason = resolve_since(config, issues, override)
+    heads = previous_heads(issues)
+
+    eligible, skipped = eligible_repos(list_repos(github, config), config)
+    skipped["unchanged"] = 0
+    repos, new_heads = [], {}
+    for repo in eligible:
+        name = repo["name"]
+        if touched_since(repo, since):
+            changes, head = repo_changes(github, repo, config, since, heads.get(name))
+            if changes:
+                repos.append(changes)
+            else:
+                skipped["unchanged"] += 1
+        else:
+            # Nothing pushed, so the recorded head still stands. A repository seen for
+            # the first time gets one lookup, so the next run can compare against it.
+            head = heads.get(name) or current_head(github, repo)
+            skipped["unchanged"] += 1
+        if head:
+            new_heads[name] = head
+
+    return {
+        "generated_at": format_time(now),
+        "since": format_time(since),
+        "since_reason": reason,
+        "user": config["person"]["github"],
+        "has_changes": bool(repos),
+        "repos": repos,
+        "skipped": skipped,
+        "previous_drafts": [
+            {"title": issue.get("title"), "created_at": issue.get("created_at"),
+             "body": clip(MARKER.sub("", issue.get("body") or ""), scan["previous_draft_chars"])}
+            for issue in issues[:scan["previous_drafts"]]
+        ],
+        "state": {"until": format_time(now), "heads": new_heads},
+    }
+
+
+def render(digest):
+    lines = [
+        "CHANGES  %s to %s" % (digest["since"], digest["generated_at"]),
+        "Window starts at the %s." % digest["since_reason"],
+        "",
+    ]
+    if not digest["repos"]:
+        lines.append("Nothing new in any public repository.")
+    for repo in digest["repos"]:
+        tags = ["new repository"] if repo["is_new"] else []
+        tags.append(plural(repo["commit_count"], "commit"))
+        if repo["releases"]:
+            tags.append(plural(len(repo["releases"]), "release"))
+        lines.append("### [%s](%s)  (%s)" % (repo["name"], repo["url"], ", ".join(tags)))
+        if repo["description"]:
+            lines.append(repo["description"])
+        for release in repo["releases"]:
+            lines.append("- release [%s](%s)" % (release["name"], release["url"]))
+        for commit in repo["commits"]:
+            lines.append("- `%s` %s" % (commit["sha"], commit["subject"]))
+        if repo["commits_capped"]:
+            lines.append("- and %d more" % (repo["commit_count"] - len(repo["commits"])))
+        lines.append("")
+    skipped = ", ".join("%d %s" % (value, key) for key, value in digest["skipped"].items() if value)
+    if skipped:
+        lines.append("Not in this digest: %s." % skipped)
+    return "\n".join(lines).rstrip() + "\n"
+
+
+def compose(digest, drafts=None, limit=ISSUE_LIMIT):
+    """The issue body. The marker goes first so no amount of trimming can cut it off."""
+    marker = write_marker(digest["state"])
+    if drafts and drafts.strip():
+        head = drafts.strip()
+    else:
+        head = ("No drafts this time: no model was available to write them, so this is the "
+                "list of changes alone. Paste it into any assistant together with rules.md "
+                "to get the drafts.")
+    tail = "<details><summary>What changed</summary>\n\n%s\n</details>" % render(digest).strip()
+    body = "%s\n\n%s\n\n%s\n" % (marker, head, tail)
+    if len(body) > limit:
+        body = body[:limit - len(TRUNCATED)].rstrip() + TRUNCATED + "\n"
+    return body
+
+
+# ----------------------------------------------------------------- checking drafts
+
+POST_BLOCK = re.compile(r"^```(x-post|x-reply)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
+URL = re.compile(r"https?://\S+")
+NARROW = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
+
+
+def x_length(text):
+    """Characters as X counts them: any link is 23, most scripts 1, emoji and CJK 2."""
+    text = URL.sub("x" * 23, text)
+    return sum(1 if any(low <= ord(ch) <= high for low, high in NARROW) else 2 for ch in text)
+
+
+def check_drafts(text, limit):
+    """Swap em dashes for commas and flag any X post that is over the limit.
+
+    Counting characters is the part a model gets wrong, so it is done here and the
+    result is written under the post it applies to.
+    """
+    text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")
+
+    def annotate(found):
+        length = x_length(found.group(2).strip())
+        if length <= limit:
+            return found.group(0)
+        return "%s\n> Over the limit: %d of %d characters. Trim before posting." % (
+            found.group(0), length, limit)
+
+    return POST_BLOCK.sub(annotate, text)
+
+
+# ----------------------------------------------------------------- self test
+
+class FakeGitHub:
+    """Canned answers keyed by path, so the tests never touch the network."""
+
+    def __init__(self, pages, readmes=None):
+        self.pages, self.readmes, self.calls = pages, readmes or {}, []
+
+    def get(self, path, params=None, missing=None):
+        self.calls.append(path)
+        return self.pages.get(path, missing)
+
+    def get_all(self, path, params=None):
+        self.calls.append(path)
+        return self.pages.get(path, [])
+
+    def readme(self, owner, repo):
+        return self.readmes.get(repo, "")
+
+
+def selftest():
+    config = {
+        "person": {"github": "me"},
+        "issue": {"label": "post-drafts", "repo": "me/auto-post-"},
+        "scan": {
+            "public_only": True, "include_forks": False, "include_archived": False,
+            "exclude_repos": ["Auto-Post-"], "ignore_authors": ["github-actions[bot]"],
+            "start_from": "2026-09-01T00:00:00Z", "max_commits_per_repo": 3,
+            "readme_chars": 20, "previous_drafts": 2, "previous_draft_chars": 50,
+        },
+    }
+    t = parse_time
+    failures, ran = [], []
+
+    def check(name, got, want):
+        ran.append(name)
+        if got != want:
+            failures.append("%s: got %r, want %r" % (name, got, want))
+
+    def repo(name, pushed="2026-09-20T10:00:00Z", created="2026-01-01T00:00:00Z", **extra):
+        return dict({"name": name, "full_name": "me/" + name, "owner": {"login": "me"},
+                     "default_branch": "main", "pushed_at": pushed, "created_at": created,
+                     "html_url": "https://github.com/me/" + name}, **extra)
+
+    def commit(sha, message, login="me", parents=1, name="Me", date="2026-09-20T09:00:00Z"):
+        return {"sha": sha * 7, "html_url": "u", "parents": [{}] * parents,
+                "author": {"login": login} if login else None,
+                "commit": {"message": message, "author": {"name": name, "date": date}}}
+
+    def issue(created, state=None, **extra):
+        body = "drafts" + ("\n" + write_marker(state) if state is not None else "")
+        return dict({"title": "Post drafts", "created_at": created, "body": body}, **extra)
+
+    # the window
+    check("no issues falls back to start_from",
+          resolve_since(config, []), (t("2026-09-01T00:00:00Z"), "scan.start_from in config.json"))
+    check("an issue without a marker counts from when it was opened",
+          resolve_since(config, [issue("2026-09-10T07:00:00Z"), issue("2026-09-14T07:01:00Z")])[0],
+          t("2026-09-14T07:01:00Z"))
+    check("the marker's scan time beats the issue's creation time",
+          resolve_since(config, [issue("2026-09-14T07:01:00Z", {"until": "2026-09-14T07:00:00Z"})])[0],
+          t("2026-09-14T07:00:00Z"))
+    check("start_from is a floor under an older issue",
+          resolve_since(config, [issue("2026-08-01T07:00:00Z")])[0], t("2026-09-01T00:00:00Z"))
+    check("a pull request never moves the window",
+          resolve_since(config, [issue("2026-09-15T00:00:00Z", pull_request={})])[0],
+          t("2026-09-01T00:00:00Z"))
+    check("an override wins outright",
+          resolve_since(config, [issue("2026-09-15T00:00:00Z")], "2026-08-01T00:00:00Z")[0],
+          t("2026-08-01T00:00:00Z"))
+
+    # the marker
+    state = {"until": "2026-09-14T07:00:00Z", "heads": {"a": "abc", "b": 5}}
+    check("marker round trips", read_marker("x " + write_marker(state) + " y"), state)
+    check("a mangled marker reads as empty", read_marker("<!-- auto-post-state {nope} -->"), {})
+    check("heads come from the newest issue and skip junk",
+          previous_heads([issue("2026-09-10T00:00:00Z", {"heads": {"a": "old"}}),
+                          issue("2026-09-14T00:00:00Z", state)]), {"a": "abc"})
+
+    # which repositories are looked at
+    since = t("2026-09-10T00:00:00Z")
+    repos = [
+        repo("public"), repo("secret", private=True), repo("forked", fork=True),
+        repo("old", archived=True), repo("auto-post-"),
+        repo("stale", pushed="2026-09-01T00:00:00Z"),
+        dict(repo("theirs"), owner={"login": "someone-else"}),
+    ]
+    eligible, skipped = eligible_repos(repos, config)
+    check("eligible, newest push first", [r["name"] for r in eligible], ["public", "stale"])
+    check("private skipped", skipped["private"], 1)
+    check("fork skipped", skipped["fork"], 1)
+    check("archived skipped", skipped["archived"], 1)
+    check("exclusion ignores case", skipped["excluded"], 1)
+    check("a repository pushed before the window is not touched",
+          touched_since(repo("stale", pushed="2026-09-01T00:00:00Z"), since), False)
+    check("a repository created inside the window is touched",
+          touched_since(repo("n", pushed="2026-09-01T00:00:00Z", created="2026-09-11T00:00:00Z"), since), True)
+
+    # which commits count
+    ignore = config["scan"]["ignore_authors"]
+    check("ordinary commit kept", keep_commit(commit("a", "Add x"), ignore), True)
+    check("merge dropped", keep_commit(commit("a", "Merge", parents=2), ignore), False)
+    check("listed bot dropped", keep_commit(commit("a", "Brief", login="github-actions[bot]"), ignore), False)
+    check("any [bot] name dropped", keep_commit(commit("a", "Bump", login=None, name="some[bot]"), ignore), False)
+    check("commit with no linked account kept", keep_commit(commit("a", "Fix", login=None), ignore), True)
+
+    # the digest end to end
+    old_branch_work = commit("e", "Add the latency benchmark", date="2026-09-08T09:00:00Z")
+    pages = {
+        "/repos/me/auto-post-/issues": [
+            issue("2026-09-14T07:01:00Z", {"until": "2026-09-14T07:00:00Z",
+                                           "heads": {"merged": "m" * 7, "quiet": "q" * 7,
+                                                     "rewritten": "r" * 7}}),
+            issue("2026-09-16T07:00:00Z", pull_request={}),
+        ],
+        "/users/me/repos": [
+            repo("results", pushed="2026-09-20T10:00:00Z"),
+            repo("merged", pushed="2026-09-19T12:00:00Z"),
+            repo("bots-only", pushed="2026-09-19T10:00:00Z"),
+            repo("released", pushed="2026-09-18T10:00:00Z"),
+            repo("rewritten", pushed="2026-09-17T10:00:00Z"),
+            repo("fresh", pushed="2026-09-15T10:00:00Z", created="2026-09-15T09:00:00Z"),
+            repo("quiet", pushed="2026-09-02T10:00:00Z"),
+            repo("never-seen", pushed="2026-09-02T10:00:00Z"),
+        ],
+        "/repos/me/results/commits": [
+            commit("a", "Report the 30 Hz result\n\nMeasured over 10 runs."),
+            commit("b", "Merge branch", parents=2),
+            commit("c", "Tidy"), commit("f", "Two"), commit("g", "Three"),
+        ],
+        # a branch written before the window and merged inside it: compare finds it,
+        # a date filter would not
+        "/repos/me/merged/compare/mmmmmmm...main": {"status": "ahead", "commits": [
+            old_branch_work, commit("h", "Merge pull request #4", parents=2)]},
+        "/repos/me/bots-only/commits": [commit("d", "Brief", login="github-actions[bot]")],
+        "/repos/me/released/releases": [
+            {"tag_name": "v1.0", "name": "First", "published_at": "2026-09-18T10:00:00Z",
+             "body": "notes", "html_url": "r"},
+            {"tag_name": "v0.9", "published_at": "2026-09-01T10:00:00Z", "html_url": "old"},
+            {"tag_name": "v1.1", "draft": True, "published_at": None, "html_url": "draft"},
+        ],
+        "/repos/me/released/commits": [],
+        # history rewritten: compare says diverged, so fall back to the dated list
+        "/repos/me/rewritten/compare/rrrrrrr...main": {"status": "diverged", "commits": [
+            commit(str(i), "old %d" % i, date="2026-01-01T00:00:00Z") for i in range(9)]},
+        "/repos/me/rewritten/commits": [commit("k", "Rewrite trailers out")],
+        "/repos/me/never-seen/commits": [commit("n", "Initial")],
+    }
+    github = FakeGitHub(pages, {"results": "R" * 30})
+    digest = build_digest(github, config, now=t("2026-09-21T07:00:00Z"))
+    names = [r["name"] for r in digest["repos"]]
+    by_name = {r["name"]: r for r in digest["repos"]}
+    check("window starts at the last scan, not the pull request",
+          digest["since"], "2026-09-14T07:00:00Z")
+    check("repos with something to say", names, ["results", "merged", "released", "rewritten", "fresh"])
+    check("a merged branch is found through the recorded head",
+          [c["subject"] for c in by_name["merged"]["commits"]], ["Add the latency benchmark"])
+    check("and is labelled as such", by_name["merged"]["found_by"], "since last head")
+    check("a rewritten head falls back to dates",
+          [c["subject"] for c in by_name["rewritten"]["commits"]], ["Rewrite trailers out"])
+    check("merge left out, list capped and counted",
+          ([c["subject"] for c in by_name["results"]["commits"]], by_name["results"]["commit_count"],
+           by_name["results"]["commits_capped"]),
+          (["Report the 30 Hz result", "Tidy", "Two"], 4, True))
+    check("commit body kept", by_name["results"]["commits"][0]["body"], "Measured over 10 runs.")
+    check("only the published release inside the window",
+          [r["tag"] for r in by_name["released"]["releases"]], ["v1.0"])
+    check("readme cut and marked", by_name["results"]["readme"], "R" * 20 + TRUNCATED)
+    check("a new repository with no commits still counts", by_name["fresh"]["is_new"], True)
+    check("unchanged covers bot-only and unpushed repositories", digest["skipped"]["unchanged"], 3)
+    # after a merged pull request the branch head is the merge commit itself
+    check("new heads recorded, old ones carried, first sightings looked up",
+          {k: digest["state"]["heads"].get(k) for k in ("results", "merged", "rewritten", "quiet", "never-seen")},
+          {"results": "a" * 7, "merged": "h" * 7, "rewritten": "k" * 7, "quiet": "q" * 7,
+           "never-seen": "n" * 7})
+    check("the marker is stripped from previous drafts", digest["previous_drafts"][0]["body"], "drafts")
+    check("the next window starts where this scan ended",
+          resolve_since(config, [issue("2026-09-21T07:02:00Z", digest["state"])])[0],
+          t("2026-09-21T07:00:00Z"))
+
+    # the rendered digest and the issue body
+    text = render(digest)
+    check("render names every repository", all(name in text for name in names), True)
+    check("render carries no em dash", "\u2014" in text, False)
+    body = compose(digest, "1. a post")
+    check("the issue body starts with the marker", read_marker(body.split("\n", 1)[0]), digest["state"])
+    check("no drafts still yields a usable body", "rules.md" in compose(digest, ""), True)
+    short = compose(digest, "x" * 5000, limit=1000)
+    check("an oversized body is trimmed but keeps its marker",
+          (len(short) <= 1001, read_marker(short) == digest["state"]), (True, True))
+    empty = build_digest(FakeGitHub({}), config, now=t("2026-09-21T07:00:00Z"))
+    check("nothing new means has_changes is false", empty["has_changes"], False)
+
+    # checking drafts
+    check("plain text counts one per character", x_length("abc def"), 7)
+    check("a link counts 23 whatever its length", x_length("see https://github.com/me/a-very-long-name"), 27)
+    check("emoji count two", x_length("\U0001F916"), 2)
+    long_post = "```x-post\n" + "a" * 281 + "\n```"
+    ok_post = "```x-reply\nCode and data: https://github.com/me/" + "b" * 300 + "\n```"
+    checked = check_drafts("Intro \u2014 here.\n\n" + long_post + "\n\n" + ok_post + "\n", 280)
+    check("an over-long post is flagged", "Over the limit: 281 of 280" in checked, True)
+    check("a long link does not trip the limit", checked.count("Over the limit"), 1)
+    check("em dashes become commas", ("\u2014" in checked, "Intro, here." in checked), (False, True))
+    check("a LinkedIn block is never measured against X",
+          "Over the limit" in check_drafts("```linkedin\n" + "a" * 900 + "\n```", 280), False)
+
+    if failures:
+        print("FAIL %d of %d" % (len(failures), len(ran)))
+        for failure in failures:
+            print("  " + failure)
+        return 1
+    print("ok, %d checks passed" % len(ran))
+    return 0
+
+
+# ----------------------------------------------------------------- command line
+
+def main(argv=None):
+    parser = argparse.ArgumentParser(description=__doc__,
+                                     formatter_class=argparse.RawDescriptionHelpFormatter)
+    parser.add_argument("--config", default=str(DEFAULT_CONFIG))
+    commands = parser.add_subparsers(dest="command", required=True)
+
+    commands.add_parser("since", help="print when the current window starts, and why")
+
+    scan = commands.add_parser("scan", help="build the digest of what changed")
+    scan.add_argument("--json", action="store_true", help="print JSON instead of Markdown")
+    scan.add_argument("--since", help="start the window here instead, ISO 8601")
+    scan.add_argument("--out", help="also write the JSON digest to this file")
+
+    show = commands.add_parser("render", help="print a saved JSON digest as Markdown")
+    show.add_argument("digest")
+
+    body = commands.add_parser("compose", help="print the issue body for a saved digest")
+    body.add_argument("digest")
+    body.add_argument("--drafts", help="file holding the drafts; omit when there are none")
+
+    measure = commands.add_parser("check", help="flag X posts over the limit, drop em dashes")
+    measure.add_argument("drafts")
+
+    commands.add_parser("selftest", help="run the built in tests")
+    args = parser.parse_args(argv)
+
+    if args.command == "selftest":
+        return selftest()
+    if args.command in ("render", "compose"):
+        digest = json.loads(Path(args.digest).read_text(encoding="utf-8"))
+        if args.command == "render":
+            print(render(digest), end="")
+        else:
+            drafts = Path(args.drafts).read_text(encoding="utf-8") if args.drafts else None
+            print(compose(digest, drafts), end="")
+        return 0
+
+    config = load_config(args.config)
+    if args.command == "check":
+        limit = config["posts"]["platforms"]["x"]["max_chars"]
+        print(check_drafts(Path(args.drafts).read_text(encoding="utf-8"), limit), end="")
+        return 0
+
+    github = GitHub(token_from_env())
+
+    if args.command == "since":
+        moment, reason = resolve_since(config, fetch_draft_issues(github, config, 1))
+        print("%s  (%s)" % (format_time(moment), reason))
+        return 0
+
+    digest = build_digest(github, config, override=args.since)
+    if args.out:
+        Path(args.out).write_text(json.dumps(digest, indent=2) + "\n", encoding="utf-8")
+    print(json.dumps(digest, indent=2) if args.json else render(digest), end="\n" if args.json else "")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

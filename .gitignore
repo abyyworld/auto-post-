@@ -1,0 +1,7 @@
+# Working files from a run. Drafts and digests live in the issues, never in git.
+digest.json
+raw.md
+drafts.md
+body.md
+__pycache__/
+.venv/
