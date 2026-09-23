@@ -80,12 +80,20 @@ def clip(text, limit):
     return text
 
 
-def inline(text, limit):
-    """Text for one Markdown line: no line breaks, no HTML tags, no code fences, at most limit."""
+def inline(text, limit, markdown=False):
+    """One line of text, at most limit characters, ending in "..." when shortened.
+
+    With markdown, it is also safe inside a Markdown list item or link text: nothing in it
+    can open a tag, a code span or a code fence, or close a link.
+    """
     text = " ".join((text or "").split())
     if len(text) > limit:
         text = text[:limit].rstrip() + "..."
-    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "\\`")
+    if markdown:
+        text = text.replace("\\", "\\\\").replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;")
+        for char in "`~[]":
+            text = text.replace(char, "\\" + char)
+    return text
 
 
 def plural(count, word):
@@ -210,19 +218,22 @@ def issue_until(issue):
 
 
 def previous_heads(issues, before=None):
-    """Head commits recorded by the newest issue, by repository name.
+    """The newest recorded head of each repository, by name.
 
-    With before, the newest issue whose scan ran at or before that moment, so a scan
+    Issues are read newest first and the first head seen for a repository wins, so an
+    issue whose marker was edited away, or which left a repository out, costs nothing.
+    With before, only issues whose scan ran at or before that moment count, so a scan
     started from an earlier point compares from the heads that were current then.
     """
     issues = draft_issues(issues)
     if before is not None:
         issues = [issue for issue in issues if issue_until(issue) <= before]
-    if not issues:
-        return {}
-    latest = max(issues, key=lambda issue: parse_time(issue["created_at"]))
-    heads = read_marker(latest.get("body")).get("heads") or {}
-    return {name: sha for name, sha in heads.items() if isinstance(sha, str)}
+    heads = {}
+    for issue in sorted(issues, key=lambda issue: parse_time(issue["created_at"]), reverse=True):
+        for name, sha in (read_marker(issue.get("body")).get("heads") or {}).items():
+            if isinstance(sha, str):
+                heads.setdefault(name, sha)
+    return heads
 
 
 ISSUE_PAGE = 30  # one request; enough to find the issue a --since run needs
@@ -306,50 +317,76 @@ def current_head(github, repo):
     return latest[0]["sha"] if latest else None
 
 
-def new_commits(github, repo, since, previous):
-    """Return (commits newest first, head sha, how they were found).
+def commit_key(commit):
+    """What survives a history rewrite that only touches messages or committers."""
+    author = (commit.get("commit") or {}).get("author") or {}
+    message = ((commit.get("commit") or {}).get("message") or "").strip()
+    return author.get("name"), author.get("date"), message.partition("\n")[0].strip()
 
-    From the previous head when there is one and it is still an ancestor of the
-    branch. Otherwise, commits dated inside the window.
+
+def new_commits(github, repo, since, previous, whole_history=False):
+    """Return (commits newest first, head sha, how they were found, how many there are).
+
+    From the previous head when there is one: everything the branch gained since. If the
+    history was rewritten under it, the rewritten copies of commits already seen are
+    recognised by author, date and subject and left out. With no usable head, a new
+    repository gives its whole history and any other gives the commits dated in the window.
     """
+    branch, name = repo["default_branch"], repo["full_name"]
     if previous:
-        compared = github.get("/repos/%s/compare/%s...%s"
-                              % (repo["full_name"], previous, repo["default_branch"]))
-        if compared and compared.get("status") in ("ahead", "identical"):
-            commits = list(reversed(compared.get("commits") or []))
-            return commits, (commits[0]["sha"] if commits else previous), "since last head"
+        compared = github.get("/repos/%s/compare/%s...%s" % (name, previous, branch))
+        if compared:
+            commits = compared.get("commits") or []
+            total = compared.get("total_commits", len(commits))
+            complete = total <= len(commits)
+            if compared.get("status") in ("ahead", "identical"):
+                head = (commits[-1]["sha"] if commits else previous) if complete else current_head(github, repo)
+                return list(reversed(commits)), head, "since last head", total
+            back = github.get("/repos/%s/compare/%s...%s" % (name, branch, previous)) if complete else None
+            if compared.get("status") == "diverged" and back and \
+                    back.get("total_commits", 0) <= len(back.get("commits") or []):
+                seen = {commit_key(commit) for commit in back.get("commits") or []}
+                fresh = [commit for commit in commits if commit_key(commit) not in seen]
+                head = commits[-1]["sha"] if commits else current_head(github, repo)
+                return list(reversed(fresh)), head, "since last head, history rewritten", len(fresh)
 
-    commits = github.get("/repos/%s/commits" % repo["full_name"], {
-        "sha": repo["default_branch"],
-        "since": format_time(since),
-        "per_page": 100,
-    }, missing=[]) or []
+    query = {"sha": branch, "per_page": 100}
+    if not whole_history:
+        query["since"] = format_time(since)
+    commits = github.get("/repos/%s/commits" % name, query, missing=[]) or []
     head = commits[0]["sha"] if commits else current_head(github, repo)
-    return commits, head, "dated in window"
+    return commits, head, "whole history" if whole_history else "dated in window", len(commits)
 
 
-def repo_changes(github, repo, config, since, previous):
-    """Return (what happened in the window or None, the head to remember)."""
-    scan = config["scan"]
-    limit = scan["max_commits_per_repo"]
-    raw, head, method = new_commits(github, repo, since, previous)
-    kept = [summarise_commit(c) for c in raw if keep_commit(c, scan["ignore_authors"])]
-
-    releases = []
-    for release in github.get("/repos/%s/releases" % repo["full_name"],
-                              {"per_page": 10}, missing=[]) or []:
+def releases_in_window(github, repo, since, now):
+    """Published releases with since <= published_at < now, newest first."""
+    found = []
+    for release in github.get("/repos/%s/releases" % repo["full_name"], {"per_page": 10}, missing=[]) or []:
         published = parse_time(release.get("published_at"))
-        if release.get("draft") or not published or published < since:
+        if release.get("draft") or not published or not since <= published < now:
             continue
-        releases.append({
+        found.append({
             "tag": release.get("tag_name"),
             "name": release.get("name") or release.get("tag_name"),
             "published_at": release.get("published_at"),
             "body": clip(release.get("body"), 2000),
             "url": release.get("html_url"),
         })
+    return found
 
-    is_new = (parse_time(repo.get("created_at")) or since) >= since
+
+def repo_changes(github, repo, config, since, now, previous, whole_history=False, releases=None):
+    """Return (what happened in the window [since, now) or None, the head to remember)."""
+    scan = config["scan"]
+    limit = scan["max_commits_per_repo"]
+    raw, head, method, total = new_commits(github, repo, since, previous, whole_history)
+    kept = [summarise_commit(c) for c in raw if keep_commit(c, scan["ignore_authors"])]
+    count = len(kept) + max(total - len(raw), 0)  # commits beyond what one request returned
+    if releases is None:
+        releases = releases_in_window(github, repo, since, now)
+
+    created = parse_time(repo.get("created_at"))
+    is_new = bool(created) and since <= created < now
     if not kept and not releases and not is_new:
         return None, head
 
@@ -365,8 +402,8 @@ def repo_changes(github, repo, config, since, previous):
         "pushed_at": repo.get("pushed_at"),
         "is_new": is_new,
         "found_by": method,
-        "commit_count": len(kept),
-        "commits_capped": len(kept) > limit,
+        "commit_count": count,
+        "commits_capped": count > min(len(kept), limit),
         "commits": kept[:limit],
         "releases": releases,
         "readme": clip(github.readme(repo["owner"]["login"], repo["name"]), scan["readme_chars"]),
@@ -386,25 +423,39 @@ def build_digest(github, config, override=None, now=None):
     scan = config["scan"]
     issues = fetch_draft_issues(github, config)
     since, reason = resolve_since(config, issues, override)
-    # Compare from the heads current at the start of the window; carry forward the newest.
-    heads = previous_heads(issues, before=since if override else None)
-    latest_heads = previous_heads(issues)
+    start = parse_time(scan["start_from"])
+    if not override and since == start:
+        # The window starts at start_from, after any recorded scan: heads recorded before
+        # it would pull in older work, so every repository is read by date instead.
+        heads, latest_heads = {}, {}
+    else:
+        # Compare from the heads current at the start of the window; carry the newest forward.
+        heads = previous_heads(issues, before=since if override else None)
+        latest_heads = previous_heads(issues)
 
     eligible, skipped = eligible_repos(list_repos(github, config), config)
     skipped["unchanged"] = 0
     repos, new_heads = [], {}
     for repo in eligible:
         name = repo["name"]
-        if touched_since(repo, since):
-            changes, head = repo_changes(github, repo, config, since, heads.get(name))
+        previous = heads.get(name)
+        # A repository created since start_from with no recorded head is read whole, so a
+        # project pushed with its local history, or first seen while empty, loses nothing.
+        whole = not previous and not latest_heads.get(name) and \
+            (parse_time(repo.get("created_at")) or start) >= start
+        # Publishing a release from a tag already pushed moves no pushed_at, so releases
+        # are looked up for every repository.
+        releases = releases_in_window(github, repo, since, now)
+        if touched_since(repo, since) or releases or whole:
+            changes, head = repo_changes(github, repo, config, since, now, previous, whole, releases)
             if changes:
                 repos.append(changes)
             else:
                 skipped["unchanged"] += 1
         else:
-            # Nothing pushed, so the recorded head still stands. A repository seen for
-            # the first time gets one lookup, so the next run can compare against it.
-            head = latest_heads.get(name) or heads.get(name) or current_head(github, repo)
+            # Nothing pushed, so the newest recorded head still stands. A repository with
+            # none gets one lookup, so the next run can compare against it.
+            head = latest_heads.get(name) or current_head(github, repo)
             skipped["unchanged"] += 1
         if head:
             new_heads[name] = head
@@ -426,8 +477,12 @@ def build_digest(github, config, override=None, now=None):
     }
 
 
-def render(digest, max_commits=None, max_repos=None):
-    """The digest as Markdown. max_commits and max_repos shorten it, saying what was left out."""
+def render(digest, max_commits=None, max_repos=None, markdown=False):
+    """The digest as text. markdown escapes it for the issue; max_commits and max_repos
+    shorten it, saying what was left out."""
+    def line(text, limit):
+        return inline(text, limit, markdown)
+
     lines = [
         "CHANGES  %s to %s" % (digest["since"], digest["generated_at"]),
         "Window starts at the %s." % digest["since_reason"],
@@ -443,13 +498,12 @@ def render(digest, max_commits=None, max_repos=None):
             tags.append(plural(len(repo["releases"]), "release"))
         lines.append("### [%s](%s)  (%s)" % (repo["name"], repo["url"], ", ".join(tags)))
         if repo["description"]:
-            lines.append(inline(repo["description"], 300))
+            lines.append(line(repo["description"], 300))
         for release in repo["releases"]:
-            lines.append("- release [%s](%s)" % (inline(release["name"], 200).replace("]", "\\]"),
-                                                 release["url"]))
+            lines.append("- release [%s](%s)" % (line(release["name"], 200), release["url"]))
         commits = repo["commits"] if max_commits is None else repo["commits"][:max_commits]
         for commit in commits:
-            lines.append("- `%s` %s" % (commit["sha"], inline(commit["subject"], 200)))
+            lines.append("- `%s` %s" % (commit["sha"], line(commit["subject"], 200)))
         if repo["commit_count"] > len(commits):
             lines.append("- and %d more" % (repo["commit_count"] - len(commits)))
         lines.append("")
@@ -462,19 +516,19 @@ def render(digest, max_commits=None, max_repos=None):
     return "\n".join(lines).rstrip() + "\n"
 
 
-def render_within(digest, limit):
-    """render(), shortened until it fits in limit characters: fewer commits, then fewer repos."""
+def renderings(digest):
+    """The issue's Markdown list, longest first: all commits, then fewer, then fewer repos."""
     for max_commits in (None, 10, 3, 0):
-        text = render(digest, max_commits)
-        if len(text) <= limit:
-            return text
+        yield render(digest, max_commits, markdown=True)
     count = len(digest["repos"])
     while count > 0:
         count //= 2
-        text = render(digest, 0, count)
-        if len(text) <= limit:
-            return text
-    return None
+        yield render(digest, 0, count, markdown=True)
+
+
+def render_within(digest, limit):
+    """The longest of renderings() that fits in limit characters, or None."""
+    return next((text for text in renderings(digest) if len(text) <= limit), None)
 
 
 def for_assistant(digest, limit):
@@ -514,15 +568,26 @@ def for_assistant(digest, limit):
 def compose(digest, drafts=None, limit=ISSUE_LIMIT):
     """The issue body, at most limit characters. The marker goes first and is never cut.
 
-    Without drafts, the body carries the digest itself, so any assistant given it with
-    rules.md and config.json has every fact the rules require a claim to trace to. Each
-    part is shortened to fit rather than cut through, so every block stays closed.
+    With drafts: the drafts, then the list of changes in whatever room is left. Without:
+    a note, the list of changes, and the digest itself, so any assistant given it with
+    rules.md and config.json has every fact a claim must trace to. The list is kept whole
+    whenever some version of the digest still fits beside it. Each part is shortened to
+    fit rather than cut through, so every block stays closed.
     """
     marker = write_marker(digest["state"])
     if len(marker) + 200 > limit:
         raise ValueError("the state marker alone is %d characters, over the %d limit"
                          % (len(marker), limit))
-    details = "<details><summary>%s</summary>\n\n%s\n</details>"
+
+    def assemble(parts):
+        return "\n\n".join(parts) + "\n"
+
+    def listed(text):
+        return "<details><summary>What changed</summary>\n\n%s\n</details>" % text.strip()
+
+    def room_after(parts, wrapper):
+        return limit - len(assemble(parts)) - 2 - len(wrapper)
+
     if drafts and drafts.strip():
         head = drafts.strip()
         room = limit - len(marker) - 200
@@ -531,36 +596,26 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
         if sum(1 for line in head.split("\n") if line.startswith("```")) % 2:
             head += "\n```"  # close a fence left open, by the cut or by the model
         parts = [marker, head]
-    else:
-        head = ("No drafts this time: no model was available to write them. To get them, give any "
-                "assistant rules.md, config.json and the digest below, and ask it to follow rules.md. "
-                "Then run `python3 scan.py check` on what it writes before posting, since that "
-                "assistant cannot run it.")
-        parts = [marker, head]
+        changes = render_within(digest, room_after(parts, listed("")))
+        return assemble(parts + ([listed(changes)] if changes else []))
 
-    used = sum(len(part) + 2 for part in parts) + 1
-    digest_part = None
-    if not (drafts and drafts.strip()):
-        wrapper = details % ("Digest for an assistant", "```json\n%s\n```")
-        room = limit - used - len(wrapper % "") - 2
-        reserve = min(6000, max(room, 0) // 4)  # the person's list is never starved
-        digest_json = for_assistant(digest, room - reserve)
-        if digest_json is None:
-            parts[1] += (" The digest was too large to include; run `python3 scan.py scan --json "
-                         "--since %s` to get it." % digest["since"])
-            used += len(parts[1]) - len(head)
-        else:
-            digest_part = wrapper % digest_json
-            used += len(digest_part) + 2
+    note = ("No drafts this time: no model was available to write them. To get them, give any "
+            "assistant rules.md, config.json and the digest below, and ask it to follow rules.md. "
+            "Then run `python3 scan.py check` on what it writes before posting, since that "
+            "assistant cannot run it.")
+    wrapper = "<details><summary>Digest for an assistant</summary>\n\n```json\n%s\n```\n</details>"
+    for changes in renderings(digest):
+        parts = [marker, note, listed(changes)]
+        digest_json = for_assistant(digest, room_after(parts, wrapper % ""))
+        if digest_json is not None:
+            return assemble(parts + [wrapper % digest_json])
 
-    changes = render_within(digest, limit - used - len(details % ("What changed", "")) - 2)
-    if changes is not None:
-        parts.append(details % ("What changed", changes.strip()))
-    if digest_part:
-        parts.append(digest_part)
-
-    body = "\n\n".join(parts) + "\n"
-    if len(body) > limit:  # only reachable through the note above; never cut the marker
+    note += (" The digest was too large to include; run `python3 scan.py scan --json --since %s` "
+             "to get it." % digest["since"])
+    parts = [marker, note]
+    changes = render_within(digest, room_after(parts, listed("")))
+    body = assemble(parts + ([listed(changes)] if changes else []))
+    if len(body) > limit:  # only the note is left to shorten; the marker is never cut
         body = body[:limit - len(TRUNCATED) - 1].rstrip() + TRUNCATED + "\n"
     return body
 
@@ -715,10 +770,16 @@ class FakeGitHub:
     def get(self, path, params=None, missing=None):
         self.calls.append(path)
         page = self.pages.get(path, missing)
+        params = params or {}
         if path.endswith("/issues") and page:
             # As GitHub does: newest first, one page of per_page, pull requests included.
             page = sorted(page, key=lambda item: item["created_at"], reverse=True)
-            page = page[:(params or {}).get("per_page", 30)]
+            page = page[:params.get("per_page", 30)]
+        if path.endswith("/commits") and page:
+            # As GitHub does: since filters by date, one page of per_page.
+            if params.get("since"):
+                page = [c for c in page if parse_time(c["commit"]["author"]["date"]) >= parse_time(params["since"])]
+            page = page[:params.get("per_page", 30)]
         return page
 
     def get_all(self, path, params=None):
@@ -918,6 +979,87 @@ def selftest():
           resolve_since(config, [issue("2026-09-21T07:02:00Z", digest["state"])])[0],
           t("2026-09-21T07:00:00Z"))
 
+    # history rewrites, new repositories, releases on old tags, the start_from floor, races
+    def subjects(result):
+        return [c["subject"] for c in result["repos"][0]["commits"]] if result["repos"] else ["<no repository>"]
+
+    def world(extra_pages, repos_list, issues_list):
+        pages_w = dict(extra_pages)
+        pages_w["/users/me/repos"] = repos_list
+        pages_w["/repos/me/auto-post-/issues"] = issues_list
+        return FakeGitHub(pages_w)
+
+    last = issue("2026-09-25T07:35:00Z", {"until": "2026-09-25T07:34:00Z", "heads": {"proj": "p" * 7}})
+    old_p = commit("p", "Tune the controller", date="2026-09-24T10:00:00Z")
+    amended = dict(commit("P", "Tune the controller\n\nReworded body.", date="2026-09-24T10:00:00Z"))
+    pr_work = commit("w", "Add the grasp benchmark", date="2026-09-24T12:00:00Z")
+    merge = commit("m", "Merge pull request #7", parents=2, date="2026-09-26T10:00:00Z")
+    rewritten = build_digest(world({
+        "/repos/me/proj/compare/ppppppp...main": {"status": "diverged", "total_commits": 3,
+                                                  "commits": [amended, pr_work, merge]},
+        "/repos/me/proj/compare/main...ppppppp": {"status": "diverged", "total_commits": 1, "commits": [old_p]},
+    }, [repo("proj", pushed="2026-09-26T10:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("a force-push in the same window as a merge keeps the merged work and drops rewritten copies",
+          (subjects(rewritten), rewritten["state"]["heads"].get("proj")),
+          (["Add the grasp benchmark"], "m" * 7))
+
+    local = [commit("z", "Write the README", date="2026-09-26T12:00:00Z"),
+             commit("y", "Success rate 81% over 120 trials", date="2026-09-21T09:00:00Z")]
+    pushed_whole = build_digest(world({"/repos/me/grasp-sim/commits": local},
+                                      [repo("grasp-sim", pushed="2026-09-26T12:00:00Z", created="2026-09-26T11:00:00Z")],
+                                      [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("a new repository pushed with its local history is read whole",
+          subjects(pushed_whole),
+          ["Write the README", "Success rate 81% over 120 trials"])
+    empty_first = build_digest(world({"/repos/me/grasp-sim/commits": local},
+                                     [repo("grasp-sim", pushed="2026-09-26T12:00:00Z", created="2026-09-24T11:00:00Z")],
+                                     [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("a repository first seen empty is read whole once it has history",
+          len(subjects(empty_first)), 2)
+
+    tagged = build_digest(world({"/repos/me/proj/releases": [
+        {"tag_name": "v1.0", "name": "v1.0", "published_at": "2026-09-25T12:00:00Z", "html_url": "r"}],
+        "/repos/me/proj/compare/ppppppp...main": {"status": "identical", "total_commits": 0, "commits": []}},
+        [repo("proj", pushed="2026-09-25T07:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("a release published from a tag pushed earlier is still reported",
+          [r["tag"] for r in tagged["repos"][0]["releases"]] if tagged["repos"] else [], ["v1.0"])
+
+    floor_config = json.loads(json.dumps(config))
+    floor_config["scan"]["start_from"] = "2026-09-30T00:00:00Z"
+    floored = build_digest(world({
+        "/repos/me/proj/compare/ppppppp...main": {"status": "ahead", "total_commits": 2, "commits": [
+            commit("o", "Old experiment, skip me", date="2026-09-26T09:00:00Z"),
+            commit("n", "New work after the break", date="2026-10-01T09:00:00Z")]},
+        "/repos/me/proj/commits": [commit("n", "New work after the break", date="2026-10-01T09:00:00Z"),
+                                   commit("o", "Old experiment, skip me", date="2026-09-26T09:00:00Z")]},
+        [repo("proj", pushed="2026-10-01T09:00:00Z")], [last]), floor_config, now=t("2026-10-02T07:34:00Z"))
+    check("a start_from after the last scan is a real floor",
+          (floored["since"], subjects(floored)),
+          ("2026-09-30T00:00:00Z", ["New work after the break"]))
+
+    raced = build_digest(world({"/repos/me/proj/releases": [
+        {"tag_name": "v2", "name": "v2", "published_at": "2026-09-28T07:34:20Z", "html_url": "r"}],
+        "/repos/me/proj/compare/ppppppp...main": {"status": "identical", "total_commits": 0, "commits": []}},
+        [repo("proj", pushed="2026-09-25T07:00:00Z"),
+         repo("late", pushed="2026-09-28T07:34:10Z", created="2026-09-28T07:34:10Z")], [last]),
+        config, now=t("2026-09-28T07:34:00Z"))
+    check("a release or repository appearing during the scan waits for the next window",
+          [r["name"] for r in raced["repos"]], [])
+
+    big = build_digest(world({
+        "/repos/me/proj/compare/ppppppp...main": {"status": "ahead", "total_commits": 300,
+                                                  "commits": [commit("s", "step %d" % i) for i in range(250)]},
+        "/repos/me/proj/commits": [commit("T", "the tip")]},
+        [repo("proj", pushed="2026-09-26T10:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("more than one page of new commits counts them all and records the real tip",
+          ((big["repos"] or [{}])[0].get("commit_count"), (big["repos"] or [{}])[0].get("commits_capped"),
+           big["state"]["heads"].get("proj")),
+          (300, True, "T" * 7))
+
+    markerless = dict(issue("2026-09-27T07:00:00Z"), body="edited by hand")
+    check("an issue whose marker was edited away does not hide the heads before it",
+          previous_heads([last, markerless]), {"proj": "p" * 7})
+
     # the rendered digest and the issue body
     text = render(digest)
     check("render names every repository", all(name in text for name in names), True)
@@ -983,12 +1125,36 @@ def selftest():
         check("tags and fences inside commit text cannot break the issue (%s)" % ("drafts" if drafts else "no drafts"),
               (body.count("<details>"), body.count("</details>"), len(fences) % 2, parsed),
               (2 if not drafts else 1, 2 if not drafts else 1, 0, True))
+    fancy = json.loads(json.dumps(digest))
+    fancy["repos"][0]["description"] = "~~~ tilde notes"
+    fancy["repos"][0]["releases"] = [{"tag": "v2", "name": "[Beta] v2.0\\", "published_at": "x", "body": "", "url": "u"}]
+    fancy["repos"][0]["commits"][0]["subject"] = "Use `scan.py` for the R&D check"
+    marked, plain = render(fancy, markdown=True), render(fancy)
+    check("Markdown escaping in the issue, plain text in the log",
+          ("\\~\\~\\~ tilde notes" in marked, "- release [\\[Beta\\] v2.0\\\\](u)" in marked,
+           "Use \\`scan.py\\` for the R&amp;D check" in marked, "Use `scan.py` for the R&D check" in plain,
+           "~~~ tilde notes" in plain),
+          (True, True, True, True, True))
     long_line = render(odd).split("\n")
     check("a long commit subject stays on one line, shortened with an ellipsis",
           [line for line in long_line if "stray" in line][0].endswith("x..."), True)
     unclosed = compose(digest, "```x-post\nA post the model never closed")
     check("drafts that leave a fence open are closed before the list",
           sum(1 for line in unclosed.split("\n") if line.startswith("```")) % 2, 0)
+    before_list = unclosed.split("<details><summary>What changed")[0]
+    check("an open fence in the drafts is closed before the list, not after it",
+          sum(1 for line in before_list.split("\n") if line.startswith("```")) % 2, 0)
+    three = json.loads(json.dumps(digest))
+    three["previous_drafts"] = [{"title": "p", "created_at": "x", "body": "d" * 6000}] * 2
+    three["repos"] = [dict(three["repos"][0], name="repo-%d" % i, readme="R" * 6000, commits_capped=False,
+                           commits=[dict(three["repos"][0]["commits"][0], subject="s" * 50, body="b" * 300)] * 40,
+                           commit_count=40) for i in range(3)]
+    kept_whole = compose(three, "")
+    check("without drafts the list keeps every commit when a shorter digest fits beside it",
+          ("more" in kept_whole.split("Digest for an assistant")[0], "```json" in kept_whole), (False, True))
+    ideal = compose(three, "", limit=10 ** 6)
+    exact = compose(three, "", limit=len(ideal))
+    check("a body that fits exactly is not shortened", exact, ideal)
     cut = compose(digest, "```x-post\n" + "word " * 2000 + "\n```", limit=5000)
     check("drafts cut to fit never leave a code fence open",
           sum(1 for line in cut.split("\n") if line.startswith("```")) % 2, 0)
