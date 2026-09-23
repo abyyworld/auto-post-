@@ -5,12 +5,13 @@ Post drafts: the judgement half.
 Hands rules.md, config.json and the digest from scan.py to Claude and prints the drafts
 on stdout.
 
-This is the only vendor specific file in the repository. Its contract is three lines long:
+This is the only vendor specific code in the repository. Its contract is three lines long:
 
     read rules.md and config.json, read the digest, print the drafts
 
 To move to a different provider, reimplement that contract in this file, then change the
-secret and the package named in the workflow's "Write the drafts" step. Nothing else changes.
+three provider lines in the workflow's "Write the drafts" step: the secret it passes in, the
+check that the secret is set, and the package it installs. Nothing else changes.
 
     pip install anthropic
     export ANTHROPIC_API_KEY=...
@@ -37,7 +38,8 @@ rules tell you to trust. It is the complete list of what is new. Do not add work
 it, and do not second guess which commits are new.
 
 Output only the drafts, in the format section 7 of the rules specifies, or `NOTHING TO POST`
-as section 3 describes. No preamble, no closing summary, no offer to help further.
+as section 3 describes. No preamble, no closing summary, no offer to help further. You cannot
+run commands, and a check follows: `scan.py check` runs on your output before anyone sees it.
 
 --- rules.md ---
 %s

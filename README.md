@@ -25,7 +25,7 @@ GitHub    open the issue, assign it to me           workflow, Mon Wed Fri 07:30 
 The split is deliberate. Deciding which commits are new, and counting characters, are what a
 model gets quietly wrong, so they are done in code. The model only does the judgement and the
 writing. That also makes it portable: `rules.md` names no vendor, and switching model provider
-means replacing `draft.py` and changing two lines in the workflow.
+means replacing `draft.py` and changing three lines in the workflow.
 
 "New" means new since the previous drafts issue. Each issue carries a hidden marker with every
 repository's head commit, so work on a branch that is merged days later still counts, and
@@ -35,7 +35,7 @@ nothing is drafted twice. There is no state file and no bot commits; the issues 
 
 1. Add a repository secret `ANTHROPIC_API_KEY` under Settings, Secrets and variables, Actions.
    Without it the issue still arrives with what changed and the digest, ready to hand to any
-   assistant with `rules.md` and `config.json`.
+   assistant with `rules.md` and `config.json`; run `python3 scan.py check` on what it writes.
 2. Run it once by hand from the Actions tab (Post drafts, Run workflow) to see a batch.
 
 ## What each draft gives you

@@ -1,8 +1,8 @@
 # Post drafts, three times a week.
 #
 # Runs on GitHub's infrastructure rather than any AI vendor's, so the schedule survives
-# switching model providers. Swapping provider means replacing draft.py, plus the secret and
-# the package named in the "Write the drafts" step below.
+# switching model providers. Swapping provider means replacing draft.py, plus three lines in
+# the "Write the drafts" step below: the secret, the check that it is set, and the package.
 #
 # Setup, once:
 #   Settings > Secrets and variables > Actions > New repository secret

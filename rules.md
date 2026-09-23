@@ -153,8 +153,11 @@ against its platform's limits in `config.json` and flags any that break them. No
 this shape: no preamble, no closing summary, no offer to help further.
 
 If you can run commands, write the drafts to a file, run `python3 scan.py check <file>`, fix
-every block it flags, and output the checked text. If you cannot, whatever ran you checks them
-afterwards; the scheduled workflow always does.
+every block it flags, and run it again until nothing is flagged; then output the checked text.
+If you cannot run commands and were not told that a check follows, count X posts yourself as
+section 6 describes, keep each one at least 20 characters under `max_chars` for safety, and end
+with the single line `Not run through scan.py check.` so the owner knows to check before
+posting.
 
 ````
 ## 1. <a few words naming the result>

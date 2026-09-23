@@ -79,7 +79,8 @@ for a small run.
 1. Add a repository secret named `ANTHROPIC_API_KEY` under Settings, Secrets and variables,
    Actions. Without it the issue still arrives three times a week, carrying what changed and
    the digest itself; give that digest, `rules.md` and `config.json` to any assistant to get
-   the drafts.
+   the drafts, then run `python3 scan.py check` on them before posting, because that assistant
+   cannot.
 2. GitHub only runs scheduled workflows from the **default branch**. Keep the workflow there.
    `workflow_dispatch` in the Actions tab runs it by hand at any time.
 
@@ -91,8 +92,9 @@ push on the phone with the GitHub app.
 With no API key and no workflow, an assistant that can run Python does the same job:
 
 1. `python3 scan.py scan --json --out digest.json`
-2. Follow `rules.md` against that digest and write the drafts to a file.
-3. `python3 scan.py check <drafts file> > drafts.md`, and fix every block it flags.
+2. Follow `rules.md` against that digest and write the drafts to `raw.md`.
+3. `python3 scan.py check raw.md > drafts.md`. Fix each flagged block in `raw.md` and run it
+   again until nothing is flagged. Never check a file into itself: the shell empties it first.
 4. Optionally open the issue from `python3 scan.py compose digest.json --drafts drafts.md`
    with the label in `config.json`, so the next run starts where this one stopped. Skip this and
    the next run simply covers the same window again.
@@ -102,8 +104,9 @@ With no API key and no workflow, an assistant that can run Python does the same 
 Nothing here depends on one vendor. The rules are Markdown, the config is JSON, the scanner is
 standard library Python. Only `draft.py` calls a model, through the Anthropic SDK. To switch
 provider, replace that one file; its contract is to read `rules.md`, `config.json` and the
-digest and print the drafts on stdout. Then change the two provider lines in the workflow's
-"Write the drafts" step: the secret it passes in and the package it installs.
+digest and print the drafts on stdout. Then change the three provider lines in the workflow's
+"Write the drafts" step: the secret it passes in, the check that the secret is set, and the
+package it installs.
 
 | Option | Where it runs | Portability |
 | --- | --- | --- |

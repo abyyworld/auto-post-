@@ -431,22 +431,36 @@ def render(digest):
 
 
 def for_assistant(digest, limit):
-    """The digest as an assistant needs it, without the state marker, as JSON under limit.
+    """The digest as an assistant needs it, as JSON of at most limit characters, or None.
 
-    README excerpts are the bulk, so they shrink first. The result always parses.
+    The state marker is left out. The biggest parts shrink first: README excerpts, then
+    commit and release bodies, then previous drafts, then the commit lists themselves,
+    and anything cut says so. The result always parses; None means even the smallest
+    version does not fit.
     """
-    for readme_chars in (None, 2000, 500, 0):
-        copy = json.loads(json.dumps(digest))
-        copy.pop("state", None)
-        for repo in copy["repos"]:
-            if readme_chars is not None:
-                repo["readme"] = clip(repo["readme"], readme_chars) if readme_chars else "[left out to fit]"
+    copy = json.loads(json.dumps(digest))
+    copy.pop("state", None)
+    steps = [
+        lambda d: None,
+        lambda d: [r.update(readme=clip(r["readme"], 2000)) for r in d["repos"]],
+        lambda d: [r.update(readme=clip(r["readme"], 500)) for r in d["repos"]],
+        lambda d: [c.update(body=clip(c["body"], 150)) for r in d["repos"] for c in r["commits"]]
+                  + [x.update(body=clip(x["body"], 300)) for r in d["repos"] for x in r["releases"]],
+        lambda d: d.update(previous_drafts=[]),
+        lambda d: [r.update(readme="[left out to fit]") for r in d["repos"]],
+        lambda d: [r.update(commits=r["commits"][:10], commits_capped=r["commits_capped"] or len(r["commits"]) > 10)
+                   for r in d["repos"]],
+        lambda d: [r.update(commits=r["commits"][:3], commits_capped=r["commits_capped"] or len(r["commits"]) > 3)
+                   for r in d["repos"]],
+        lambda d: [c.update(body="") for r in d["repos"] for c in r["commits"]]
+                  + [x.update(body="") for r in d["repos"] for x in r["releases"]],
+    ]
+    for step in steps:
+        step(copy)
         text = json.dumps(copy, indent=1, ensure_ascii=False)
         if len(text) <= limit:
             return text
-    copy["previous_drafts"] = []
-    copy["repos"] = [dict(repo, commits=repo["commits"][:5]) for repo in copy["repos"]]
-    return json.dumps(copy, ensure_ascii=False)
+    return None
 
 
 def compose(digest, drafts=None, limit=ISSUE_LIMIT):
@@ -461,12 +475,18 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
         parts = [marker, drafts.strip(), changes]
     else:
         note = ("No drafts this time: no model was available to write them. To get them, give any "
-                "assistant rules.md, config.json and the digest below, and ask it to follow rules.md.")
-        room = limit - len(marker) - len(note) - len(changes) - 200
-        digest_json = for_assistant(digest, max(room, 1000))
-        parts = [marker, note, changes,
-                 "<details><summary>Digest for an assistant</summary>\n\n```json\n%s\n```\n</details>"
-                 % digest_json]
+                "assistant rules.md, config.json and the digest below, and ask it to follow rules.md. "
+                "Then run `python3 scan.py check` on what it writes before posting, since that "
+                "assistant cannot run it.")
+        wrapper = "<details><summary>Digest for an assistant</summary>\n\n```json\n%s\n```\n</details>"
+        room = limit - len(marker) - len(note) - len(changes) - len(wrapper) - 10
+        digest_json = for_assistant(digest, room)
+        if digest_json is None:
+            note += (" The digest was too large to include; run `python3 scan.py scan --json` "
+                     "with --since %s to get it." % digest["since"])
+            parts = [marker, note, changes]
+        else:
+            parts = [marker, note, changes, wrapper % digest_json]
     body = "\n\n".join(parts) + "\n"
     if len(body) > limit:
         body = body[:limit - len(TRUNCATED)].rstrip() + TRUNCATED + "\n"
@@ -477,6 +497,8 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
 
 POST_BLOCK = re.compile(r"^```([a-z-]+)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
 HASHTAG = re.compile(r"(?<![\w&#/])#(?=\w*[^\W\d])\w+")
+ANNOTATION = re.compile(r"^> (?:Over the limit: \d+ of \d+ characters\. Trim before posting\."
+                        r"|\d+ hashtags?: the rules allow \d+\.)\n?", re.MULTILINE)
 NARROW = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 X_LINK_LENGTH = 23
 
@@ -596,6 +618,7 @@ def check_drafts(text, platforms):
     and the result is written under the block it applies to.
     """
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")
+    text = ANNOTATION.sub("", text)  # a re-run replaces the old flags rather than stacking them
 
     def annotate(found):
         problems = block_problems(found.group(1), found.group(2).strip(), platforms)
@@ -803,6 +826,19 @@ def selftest():
     check("an oversized digest shrinks its readmes, stays valid JSON and keeps the marker",
           (len(squeezed) <= 20001, read_marker(squeezed) == huge["state"],
            len(squeezed_json["repos"][0]["readme"]) < 50000), (True, True, True))
+    busy = json.loads(json.dumps(digest))
+    busy["repos"] = [dict(busy["repos"][0], name="r%d" % i, commits_capped=False,
+                          commits=[dict(busy["repos"][0]["commits"][0], body="b" * 600)] * 40)
+                     for i in range(8)]
+    crowded = compose(busy, "", limit=20000)
+    crowded_json = json.loads(crowded.split("```json\n", 1)[1].split("\n```", 1)[0])
+    check("8 repos of 40 long commits: the digest still fits, parses and says it was cut",
+          (len(crowded) <= 20000, crowded.rstrip().endswith("</details>"),
+           crowded_json["repos"][0]["commits_capped"], TRUNCATED in crowded), (True, True, True, False))
+    tiny = compose(busy, "", limit=3000)
+    check("a digest that cannot fit is left out and the note says how to get it",
+          ("```json" in tiny, "too large to include" in tiny, read_marker(tiny) == busy["state"]),
+          (False, True, True))
     short = compose(digest, "x" * 5000, limit=1000)
     check("an oversized body is trimmed but keeps its marker",
           (len(short) <= 1001, read_marker(short) == digest["state"]), (True, True))
@@ -859,6 +895,10 @@ def selftest():
     check("an unknown block or an unconfigured platform is left alone",
           check_drafts(block("text", "a" * 5000) + block("instagram", "a" * 5000), {"x": {"max_chars": 280}}),
           block("text", "a" * 5000) + block("instagram", "a" * 5000))
+    once = check_drafts(block("x-post", "a" * 300) + "\n", platforms)
+    check("running check twice changes nothing", check_drafts(once, platforms), once)
+    fixed = once.replace("a" * 300, "a" * 200)
+    check("a fixed post loses its old flag on the next run", "Over the limit" in check_drafts(fixed, platforms), False)
     two = check_drafts(block("x-post", "a" * 300 + " #one"), platforms)
     check("every problem gets its own line", (two.count("\n> "), two.endswith("allow 0.")), (2, True))
 
