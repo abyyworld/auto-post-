@@ -196,9 +196,20 @@ def resolve_since(config, issues, override=None):
     return floor, "scan.start_from in config.json"
 
 
-def previous_heads(issues):
-    """Head commits the newest issue recorded, by repository name."""
+def issue_until(issue):
+    """When the scan behind an issue ran: its marker's time, else when the issue was opened."""
+    return parse_time(read_marker(issue.get("body")).get("until") or issue["created_at"])
+
+
+def previous_heads(issues, before=None):
+    """Head commits recorded by the newest issue, by repository name.
+
+    With before, the newest issue whose scan ran at or before that moment, so a scan
+    started from an earlier point compares from the heads that were current then.
+    """
     issues = draft_issues(issues)
+    if before is not None:
+        issues = [issue for issue in issues if issue_until(issue) <= before]
     if not issues:
         return {}
     latest = max(issues, key=lambda issue: parse_time(issue["created_at"]))
@@ -363,7 +374,7 @@ def build_digest(github, config, override=None, now=None):
     scan = config["scan"]
     issues = fetch_draft_issues(github, config, scan["previous_drafts"])
     since, reason = resolve_since(config, issues, override)
-    heads = previous_heads(issues)
+    heads = previous_heads(issues, before=since if override else None)
 
     eligible, skipped = eligible_repos(list_repos(github, config), config)
     skipped["unchanged"] = 0
@@ -401,7 +412,8 @@ def build_digest(github, config, override=None, now=None):
     }
 
 
-def render(digest):
+def render(digest, max_commits=None, max_repos=None):
+    """The digest as Markdown. max_commits and max_repos shorten it, saying what was left out."""
     lines = [
         "CHANGES  %s to %s" % (digest["since"], digest["generated_at"]),
         "Window starts at the %s." % digest["since_reason"],
@@ -409,25 +421,45 @@ def render(digest):
     ]
     if not digest["repos"]:
         lines.append("Nothing new in any public repository.")
-    for repo in digest["repos"]:
+    shown = digest["repos"] if max_repos is None else digest["repos"][:max_repos]
+    for repo in shown:
         tags = ["new repository"] if repo["is_new"] else []
         tags.append(plural(repo["commit_count"], "commit"))
         if repo["releases"]:
             tags.append(plural(len(repo["releases"]), "release"))
         lines.append("### [%s](%s)  (%s)" % (repo["name"], repo["url"], ", ".join(tags)))
         if repo["description"]:
-            lines.append(repo["description"])
+            lines.append(clip(repo["description"], 300))
         for release in repo["releases"]:
-            lines.append("- release [%s](%s)" % (release["name"], release["url"]))
-        for commit in repo["commits"]:
-            lines.append("- `%s` %s" % (commit["sha"], commit["subject"]))
-        if repo["commits_capped"]:
-            lines.append("- and %d more" % (repo["commit_count"] - len(repo["commits"])))
+            lines.append("- release [%s](%s)" % (clip(release["name"], 200), release["url"]))
+        commits = repo["commits"] if max_commits is None else repo["commits"][:max_commits]
+        for commit in commits:
+            lines.append("- `%s` %s" % (commit["sha"], clip(commit["subject"], 200)))
+        if repo["commit_count"] > len(commits):
+            lines.append("- and %d more" % (repo["commit_count"] - len(commits)))
+        lines.append("")
+    if len(shown) < len(digest["repos"]):
+        lines.append("And %s more with changes." % plural(len(digest["repos"]) - len(shown), "repository"))
         lines.append("")
     skipped = ", ".join("%d %s" % (value, key) for key, value in digest["skipped"].items() if value)
     if skipped:
         lines.append("Not in this digest: %s." % skipped)
     return "\n".join(lines).rstrip() + "\n"
+
+
+def render_within(digest, limit):
+    """render(), shortened until it fits in limit characters: fewer commits, then fewer repos."""
+    for max_commits in (None, 10, 3, 0):
+        text = render(digest, max_commits)
+        if len(text) <= limit:
+            return text
+    count = len(digest["repos"])
+    while count > 0:
+        count //= 2
+        text = render(digest, 0, count)
+        if len(text) <= limit:
+            return text
+    return None
 
 
 def for_assistant(digest, limit):
@@ -464,32 +496,50 @@ def for_assistant(digest, limit):
 
 
 def compose(digest, drafts=None, limit=ISSUE_LIMIT):
-    """The issue body. The marker goes first so no amount of trimming can cut it off.
+    """The issue body, at most limit characters. The marker goes first and is never cut.
 
     Without drafts, the body carries the digest itself, so any assistant given it with
-    rules.md and config.json has every fact the rules require a claim to trace to.
+    rules.md and config.json has every fact the rules require a claim to trace to. Each
+    part is shortened to fit rather than cut through, so every block stays closed.
     """
     marker = write_marker(digest["state"])
-    changes = "<details><summary>What changed</summary>\n\n%s\n</details>" % render(digest).strip()
+    if len(marker) + 200 > limit:
+        raise ValueError("the state marker alone is %d characters, over the %d limit"
+                         % (len(marker), limit))
+    details = "<details><summary>%s</summary>\n\n%s\n</details>"
     if drafts and drafts.strip():
-        parts = [marker, drafts.strip(), changes]
+        head = drafts.strip()
+        room = limit - len(marker) - 200
+        if len(head) > room:
+            head = head[:room - len(TRUNCATED)].rstrip() + TRUNCATED
+        parts = [marker, head]
     else:
-        note = ("No drafts this time: no model was available to write them. To get them, give any "
+        head = ("No drafts this time: no model was available to write them. To get them, give any "
                 "assistant rules.md, config.json and the digest below, and ask it to follow rules.md. "
                 "Then run `python3 scan.py check` on what it writes before posting, since that "
                 "assistant cannot run it.")
-        wrapper = "<details><summary>Digest for an assistant</summary>\n\n```json\n%s\n```\n</details>"
-        room = limit - len(marker) - len(note) - len(changes) - len(wrapper) - 10
+        parts = [marker, head]
+
+    used = sum(len(part) + 2 for part in parts) + 1
+    share = limit - used if drafts and drafts.strip() else (limit - used) * 2 // 5
+    changes = render_within(digest, share - len(details % ("What changed", "")))
+    if changes is not None:
+        parts.append(details % ("What changed", changes.strip()))
+        used += len(parts[-1]) + 2
+
+    if not (drafts and drafts.strip()):
+        wrapper = "```json\n%s\n```"
+        room = limit - used - len(details % ("Digest for an assistant", wrapper % "")) - 2
         digest_json = for_assistant(digest, room)
         if digest_json is None:
-            note += (" The digest was too large to include; run `python3 scan.py scan --json` "
-                     "with --since %s to get it." % digest["since"])
-            parts = [marker, note, changes]
+            parts[1] += (" The digest was too large to include; run `python3 scan.py scan --json "
+                         "--since %s` to get it." % digest["since"])
         else:
-            parts = [marker, note, changes, wrapper % digest_json]
+            parts.append(details % ("Digest for an assistant", wrapper % digest_json))
+
     body = "\n\n".join(parts) + "\n"
-    if len(body) > limit:
-        body = body[:limit - len(TRUNCATED)].rstrip() + TRUNCATED + "\n"
+    if len(body) > limit:  # only reachable through the note above; never cut the marker
+        body = body[:limit - len(TRUNCATED) - 1].rstrip() + TRUNCATED + "\n"
     return body
 
 
@@ -497,8 +547,8 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
 
 POST_BLOCK = re.compile(r"^```([a-z-]+)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
 HASHTAG = re.compile(r"(?<![\w&#/])#(?=\w*[^\W\d])\w+")
-ANNOTATION = re.compile(r"^> (?:Over the limit: \d+ of \d+ characters\. Trim before posting\."
-                        r"|\d+ hashtags?: the rules allow \d+\.)\n?", re.MULTILINE)
+ANNOTATION = re.compile(r"\n> (?:Over the limit: \d+ of \d+ characters\. Trim before posting\."
+                        r"|\d+ hashtags?: the rules allow \d+\.)(?=\n|$)")
 NARROW = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 X_LINK_LENGTH = 23
 
@@ -617,6 +667,7 @@ def check_drafts(text, platforms):
     Counting characters and hashtags is the part a model gets wrong, so it is done here
     and the result is written under the block it applies to.
     """
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")
     text = ANNOTATION.sub("", text)  # a re-run replaces the old flags rather than stacking them
 
@@ -803,6 +854,19 @@ def selftest():
           {"results": "a" * 7, "merged": "h" * 7, "rewritten": "k" * 7, "quiet": "q" * 7,
            "never-seen": "n" * 7})
     check("the marker is stripped from previous drafts", digest["previous_drafts"][0]["body"], "drafts")
+    earlier = issue("2026-09-14T07:01:00Z", {"until": "2026-09-14T07:00:00Z", "heads": {"a": "old"}})
+    newest = issue("2026-09-21T07:02:00Z", {"until": "2026-09-21T07:00:00Z", "heads": {"a": "new"}})
+    check("a scan from an earlier point compares from the heads current then",
+          (previous_heads([earlier, newest]), previous_heads([earlier, newest], before=t("2026-09-14T07:00:00Z")),
+           previous_heads([earlier, newest], before=t("2026-09-01T00:00:00Z"))),
+          ({"a": "new"}, {"a": "old"}, {}))
+    replay = dict(pages)
+    replay["/repos/me/auto-post-/issues"] = [
+        issue("2026-09-21T07:02:00Z", digest["state"])] + pages["/repos/me/auto-post-/issues"]
+    again = build_digest(FakeGitHub(replay, {"results": "R" * 30}), config, override=digest["since"],
+                         now=t("2026-09-21T08:00:00Z"))
+    check("the recovery command in an oversized issue reproduces its digest",
+          [r["name"] for r in again["repos"]], names)
     check("the next window starts where this scan ended",
           resolve_since(config, [issue("2026-09-21T07:02:00Z", digest["state"])])[0],
           t("2026-09-21T07:00:00Z"))
@@ -824,7 +888,7 @@ def selftest():
     squeezed = compose(huge, "", limit=20000)
     squeezed_json = json.loads(squeezed.split("```json\n", 1)[1].split("\n```", 1)[0])
     check("an oversized digest shrinks its readmes, stays valid JSON and keeps the marker",
-          (len(squeezed) <= 20001, read_marker(squeezed) == huge["state"],
+          (len(squeezed) <= 20000, read_marker(squeezed) == huge["state"],
            len(squeezed_json["repos"][0]["readme"]) < 50000), (True, True, True))
     busy = json.loads(json.dumps(digest))
     busy["repos"] = [dict(busy["repos"][0], name="r%d" % i, commits_capped=False,
@@ -835,13 +899,26 @@ def selftest():
     check("8 repos of 40 long commits: the digest still fits, parses and says it was cut",
           (len(crowded) <= 20000, crowded.rstrip().endswith("</details>"),
            crowded_json["repos"][0]["commits_capped"], TRUNCATED in crowded), (True, True, True, False))
+    wide = json.loads(json.dumps(digest))
+    wide["repos"] = [dict(wide["repos"][0], name="repo-%d" % i, description="d" * 350,
+                          commits=[dict(wide["repos"][0]["commits"][0], subject="s" * 70)] * 40,
+                          commit_count=40) for i in range(20)]
+    for limit, drafts in ((60000, ""), (20000, ""), (5000, ""), (60000, "x" * 1000), (8000, "y" * 9000)):
+        body = compose(wide, drafts, limit=limit)
+        closed = body.count("<details>") == body.count("</details>")
+        check("20 busy repos, limit %d, %s: fits, blocks closed, marker whole"
+              % (limit, "drafts" if drafts else "no drafts"),
+              (len(body) <= limit, closed, read_marker(body) == wide["state"]), (True, True, True))
+    check("a shortened render says what it left out",
+          ("and 37 more" in render_within(wide, 20000), "more with changes" in render_within(wide, 3000)),
+          (True, True))
     tiny = compose(busy, "", limit=3000)
     check("a digest that cannot fit is left out and the note says how to get it",
           ("```json" in tiny, "too large to include" in tiny, read_marker(tiny) == busy["state"]),
           (False, True, True))
     short = compose(digest, "x" * 5000, limit=1000)
     check("an oversized body is trimmed but keeps its marker",
-          (len(short) <= 1001, read_marker(short) == digest["state"]), (True, True))
+          (len(short) <= 1000, read_marker(short) == digest["state"]), (True, True))
     empty = build_digest(FakeGitHub({}), config, now=t("2026-09-21T07:00:00Z"))
     check("nothing new means has_changes is false", empty["has_changes"], False)
 
@@ -899,6 +976,12 @@ def selftest():
     check("running check twice changes nothing", check_drafts(once, platforms), once)
     fixed = once.replace("a" * 300, "a" * 200)
     check("a fixed post loses its old flag on the next run", "Over the limit" in check_drafts(fixed, platforms), False)
+    crlf = (block("x-post", "a" * 300) + "\n" + block("instagram", "#a #b #c #d #e #f")).replace("\n", "\r\n")
+    checked_crlf = check_drafts(crlf, platforms)
+    check("CRLF text is checked like LF text", ("300 of 280" in checked_crlf, "6 hashtags" in checked_crlf),
+          (True, True))
+    tail = check_drafts(block("x-post", "word #ros2"), platforms)
+    check("a flagged block at the very end stays put on a re-run", check_drafts(tail, platforms), tail)
     two = check_drafts(block("x-post", "a" * 300 + " #one"), platforms)
     check("every problem gets its own line", (two.count("\n> "), two.endswith("allow 0.")), (2, True))
 

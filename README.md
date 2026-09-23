@@ -59,6 +59,6 @@ X does, including that `scan.py` or `README.md` in a post counts as a 23 charact
 | what is worth a post, the voice, the format | `rules.md` |
 | the schedule | `.github/workflows/post-drafts.yml` |
 | the model | `draft.py` |
-| the provider | `draft.py`, plus the secret and package in the workflow's "Write the drafts" step |
+| the provider | `draft.py`, plus three lines in the workflow's "Write the drafts" step: the secret, the check that it is set, and the package |
 
 Assistants start at [`AGENTS.md`](AGENTS.md).

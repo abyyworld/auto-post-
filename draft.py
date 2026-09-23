@@ -5,7 +5,7 @@ Post drafts: the judgement half.
 Hands rules.md, config.json and the digest from scan.py to Claude and prints the drafts
 on stdout.
 
-This is the only vendor specific code in the repository. Its contract is three lines long:
+This is the only vendor specific Python in the repository. Its contract is three lines long:
 
     read rules.md and config.json, read the digest, print the drafts
 
