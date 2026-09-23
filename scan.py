@@ -592,12 +592,14 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
         head = drafts.strip()
         room = limit - len(marker) - 200
         if len(head) > room:
-            head = head[:room - len(TRUNCATED) - 4].rstrip() + TRUNCATED
+            keep = max(room - len(TRUNCATED) - 4, 0)  # a negative slice would keep almost everything
+            head = (head[:keep].rstrip() + TRUNCATED).strip()
         if sum(1 for line in head.split("\n") if line.startswith("```")) % 2:
             head += "\n```"  # close a fence left open, by the cut or by the model
         parts = [marker, head]
         changes = render_within(digest, room_after(parts, listed("")))
-        return assemble(parts + ([listed(changes)] if changes else []))
+        body = assemble(parts + ([listed(changes)] if changes else []))
+        return body if len(body) <= limit else assemble([marker, TRUNCATED.strip()])
 
     note = ("No drafts this time: no model was available to write them. To get them, give any "
             "assistant rules.md, config.json and the digest below, and ask it to follow rules.md. "
@@ -1138,6 +1140,13 @@ def selftest():
     long_line = render(odd).split("\n")
     check("a long commit subject stays on one line, shortened with an ellipsis",
           [line for line in long_line if "stray" in line][0].endswith("x..."), True)
+    crowded_state = dict(digest["state"], heads={"repo-%04d" % i: "a" * 40 for i in range(28)})
+    near = dict(digest, state=crowded_state)
+    squeezed_drafts = [compose(near, "x" * size, limit=len(write_marker(crowded_state)) + extra)
+                       for size in (500, 70000) for extra in (200, 210, 230)]
+    check("drafts are cut to nothing, not kept whole, when the marker leaves almost no room",
+          [len(body) <= len(write_marker(crowded_state)) + extra
+           for body, extra in zip(squeezed_drafts, (200, 210, 230) * 2)], [True] * 6)
     unclosed = compose(digest, "```x-post\nA post the model never closed")
     check("drafts that leave a fence open are closed before the list",
           sum(1 for line in unclosed.split("\n") if line.startswith("```")) % 2, 0)
