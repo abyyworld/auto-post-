@@ -1,9 +1,15 @@
 # auto-post
 
 Build in public without writing every post from scratch. Three times a week this looks at what
-changed in my public GitHub repositories, drafts X posts about anything worth sharing, and
-opens them as a GitHub issue. I read them on my phone, tap copy, and post the ones I like.
-LinkedIn gets a draft only for real milestones.
+changed in my public GitHub repositories, drafts posts about anything worth sharing, and opens
+them as a GitHub issue. I read them on my phone, tap copy, and post the ones I like.
+
+| Platform | How often | What goes there |
+| --- | --- | --- |
+| X | every item, about 3 a week | results, releases, build-in-public |
+| Reddit | once or twice a month | a strong result or a release, in the one subreddit it fits |
+| Instagram | a few a month | only items that already have a clip, GIF or plot |
+| LinkedIn | rarely | milestones: a paper, a release, a launch, a new role |
 
 Nothing posts on its own.
 
@@ -12,7 +18,7 @@ Nothing posts on its own.
 ```
 scan.py   what is new since the last issue          code, with a self test
 draft.py  is any of it worth a post, and the text   a model, following rules.md
-scan.py   measure every X post against 280          code
+scan.py   measure every post against its platform    code
 GitHub    open the issue, assign it to me           workflow, Mon Wed Fri 07:30 UTC
 ```
 
@@ -33,11 +39,16 @@ nothing is drafted twice. There is no state file and no bot commits; the issues 
 
 ## What each draft gives you
 
-- an X post, or a short thread, ready to paste; it also fits Bluesky, Threads and Mastodon
-- the reply carrying the link, since X shows posts with an outside link to fewer people
+- an X post, or a short thread, ready to paste, with the reply that carries the link
 - what image or clip to attach
+- a Reddit title and the facts for the body, with the subreddit and flair, when one fits;
+  rewrite the body in your own words, because several subreddits remove AI-written posts
+- an Instagram caption when there is already a clip or plot to post
 - a LinkedIn version when it is a milestone
 - every number in the post, with where it came from, to check before posting
+
+Every post is measured in code against its platform's limits. For X that means counting the way
+X does, including that `scan.py` or `README.md` in a post counts as a 23 character link.
 
 ## Changing things
 

@@ -38,6 +38,7 @@ import json
 import os
 import re
 import sys
+import unicodedata
 import urllib.error
 import urllib.parse
 import urllib.request
@@ -448,15 +449,88 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
 # ----------------------------------------------------------------- checking drafts
 
 POST_BLOCK = re.compile(r"^```([a-z-]+)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
-URL = re.compile(r"https?://\S+")
 HASHTAG = re.compile(r"(?<![\w&#/])#(?=\w*[^\W\d])\w+")
 NARROW = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
+X_LINK_LENGTH = 23
+
+
+def x_link_patterns(path=HERE / "x-tlds.txt"):
+    """X's link rules, ported from twitter-text 3.1.0's extractUrlsWithIndices.
+
+    A link needs no https://. Any domain ending in a real top-level domain becomes one,
+    which is why scan.py, README.md and np.dot count 23 on X while config.json does not.
+    Trailing punctuation stays outside the link. The names below match the regexes in
+    twitter-text/dist/regexp so the two can be compared line by line.
+    """
+    tlds = [line.strip() for line in path.read_text(encoding="utf-8").splitlines()
+            if line.strip() and not line.startswith("#")]
+    tld = r"(?:(?:%s)(?=[^0-9a-zA-Z@+-]|$)|xn--[\-0-9a-z]+)" % "|".join(
+        sorted(map(re.escape, tlds), key=len, reverse=True))
+    latin = "\xC0-\xD6\xD8-\xF6\xF8-\xFFĀ-ɏɓɔɖɗəɛɣ" \
+            "ɨɯɲʉʋʻ̀-ͯḀ-ỿ"
+    domain_char = "[^/!'#%&()*+,\\\\\\-.:;<=>?@\\[\\]^_{|}~$\\x09-\\x0D\\x20\\x85\\xA0 ᠎" \
+                  " -     　￾﻿￿‪-‮" \
+                  "؜‎‏⁦-⁩]"
+    subdomain = "(?:(?:{c}(?:[_-]|{c})*)?{c}\\.)".format(c=domain_char)
+    domain_name = "(?:(?:{c}(?:-|{c})*)?{c}\\.)".format(c=domain_char)
+    path_char = "[a-zЀ-ӿ0-9!*';:=+,.$/%#\\[\\]\\-–_~@|&" + latin + "]"
+    parens = "\\((?:{p}+|(?:{p}*\\({p}+\\){p}*))\\)".format(p=path_char)
+    path_end = "(?:[+\\-a-zЀ-ӿ0-9=_#/" + latin + "]|" + parens + ")"
+    url_path = "(?:(?:{p}*(?:{b}{p}*)*{e})|(?:@{p}+/))".format(p=path_char, b=parens, e=path_end)
+    preceding = "(?:[^A-Za-z0-9@＠$#＃￾﻿￿]|[‪-‮؜‎‏⁦-⁩]|^)"
+    extract = re.compile(
+        "(" + preceding + ")"
+        "((https?://)?"
+        "(" + subdomain + "*" + domain_name + tld + ")"
+        "(?::([0-9]+))?"
+        "(/" + url_path + "*)?"
+        "(\\?[a-z0-9!?*'@();:&=+$/%#\\[\\]\\-_.,~|]*[a-z0-9\\-_&=#/])?)",
+        re.IGNORECASE)
+    ascii_domain = re.compile("(?:(?:[\\-a-z0-9" + latin + "]+)\\.)+" + tld, re.IGNORECASE)
+    return extract, ascii_domain
+
+
+X_EXTRACT, X_ASCII_DOMAIN = x_link_patterns()
+
+
+def x_links(text):
+    """(start, end) of every span X would turn into a link, in order."""
+    spans, position = [], 0
+    while True:
+        found = X_EXTRACT.search(text, position)
+        if not found:
+            return spans
+        position = found.end()
+        before, url, protocol, domain, path = found.group(1, 2, 3, 4, 6)
+        start = found.end() - len(url)
+        if protocol:
+            spans.append((start, found.end()))
+            continue
+        if before and before in "-_./":
+            continue
+        last = None
+        for ascii in X_ASCII_DOMAIN.finditer(domain):
+            last = [start + ascii.start(), start + ascii.end()]
+            spans.append(last)
+        if last and path:
+            last[1] = found.end()
 
 
 def x_length(text):
-    """Characters as X counts them: any link is 23, most scripts 1, emoji and CJK 2."""
-    text = URL.sub("x" * 23, text)
-    return sum(1 if any(low <= ord(ch) <= high for low, high in NARROW) else 2 for ch in text)
+    """Characters as X counts them: any link is 23, most scripts 1, emoji and CJK 2.
+
+    Agrees with twitter-text 3.1.0's parseTweet on 33,000 generated posts mixing file names,
+    domains, paths, punctuation and symbols. The one known difference: an emoji sequence
+    joined with U+200D is counted per code point, which errs long, and rules.md bans emoji.
+    """
+    text = unicodedata.normalize("NFC", text)
+    length, cursor = 0, 0
+    for start, end in [tuple(span) for span in x_links(text)] + [(len(text), len(text))]:
+        length += sum(1 if any(low <= ord(ch) <= high for low, high in NARROW) else 2
+                      for ch in text[cursor:start])
+        length += X_LINK_LENGTH if end > start else 0
+        cursor = end
+    return length
 
 
 # Each block name in rules.md section 7, the platform in config.json it belongs to, the
@@ -699,6 +773,16 @@ def selftest():
     check("plain text counts one per character", x_length("abc def"), 7)
     check("a link counts 23 whatever its length", x_length("see https://github.com/me/a-very-long-name"), 27)
     check("emoji count two", x_length("\U0001F916"), 2)
+    # Each pair was measured with twitter-text 3.1.0 parseTweet, the library X counts with.
+    measured = [
+        ("see cicatrixa.com", 27), ("see train.py", 27), ("see README.md now", 31), ("scan.py", 23),
+        ("np.dot", 23), ("model.pt", 23), ("run.sh", 23), ("foo.io", 23), ("see x.io", 27),
+        ("abyyworld.github.io/teleop-pipeline/", 23), ("www.akbarjuraev.com", 23),
+        ("https://github.com/abyyworld/vla-evals", 23), ("config.json", 11), ("plot.png", 8),
+        ("sim.mp4", 7), ("rclpy.spin", 10), ("v0.1.0", 6), ("e.g. this", 9),
+        ("./policy-evals run", 18), ("3.2 ms \u2192 1.1 ms", 16), ("Isaac Lab.", 10),
+    ]
+    check("counts agree with twitter-text", [(t, x_length(t)) for t, _ in measured], measured)
     platforms = {
         "x": {"max_chars": 280, "hashtags_max": 0},
         "reddit": {"title_max_chars": 300, "body_max_chars": 1000},

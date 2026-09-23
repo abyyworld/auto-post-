@@ -39,18 +39,121 @@
     "primary": "x",
     "platforms": {
       "x": {
+        "use": "regular: every item",
         "max_chars": 280,
         "thread_max_posts": 5,
         "hashtags_max": 0,
         "link_in_reply": true,
-        "also_fits": ["Bluesky, 300 characters", "Threads, 500 characters", "Mastodon, 500 characters"]
+        "media": "Native MP4 rather than GIF, 5 to 30 seconds, exported at 1280x720 because free accounts play back at 720p. A GIF must stay under 15 MB, 1280x1080 and 350 frames. Up to 4 images per post.",
+        "note": "A free account cannot edit a post once it is up, so every number is checked before posting."
+      },
+      "reddit": {
+        "use": "sometimes: a measured result, a release or a launch, once or twice a month at most",
+        "max_per_run": 1,
+        "title_max_chars": 300,
+        "body_max_chars": 40000,
+        "hashtags_max": 0,
+        "subreddits": [
+          {
+            "name": "r/MachineLearning",
+            "for": "ML findings with n, seeds and error bars: evaluation, imitation learning, grasping studies. Not products.",
+            "format": "Text post, title starts with [P]. Link posts are blocked on weekdays and posts without technical detail are removed.",
+            "flair": "Project",
+            "verified": true,
+            "source": "archived rules page, July 2026, and AutoModerator removal messages, September 2026"
+          },
+          {
+            "name": "r/SideProject",
+            "for": "product launches: Role Radar, Cicatrixa",
+            "format": "Title '[Project name] - [Short description]'. Say what it does, who it is for and what feedback you want. Low-karma accounts are filtered.",
+            "flair": "none required",
+            "verified": true,
+            "source": "archived sidebar, June to August 2026"
+          },
+          {
+            "name": "r/opensource",
+            "for": "releases whose repository has an OSI-listed LICENSE file",
+            "format": "Name the licence first. The rules call AI-generated content ban-worthy, so the post is written by hand.",
+            "flair": "Promotional, mandatory",
+            "verified": true,
+            "source": "archived rules page, July 2026"
+          },
+          {
+            "name": "r/Python",
+            "for": "Python-first tools only",
+            "format": "No standalone showcase posts. Use the monthly Showcase Thread, under the headings What My Project Does, Target Audience, Comparison.",
+            "flair": "not applicable",
+            "verified": true,
+            "source": "rules as of August 2026"
+          },
+          {
+            "name": "r/robotics",
+            "for": "robot demos, simulated or real, with the numbers behind them",
+            "format": "Lead with the video or GIF, then method and numbers. A bare link is removed as low effort.",
+            "flair": "required; the showcase flair on the submit form",
+            "verified": false,
+            "source": "rules captured 2023, 2026 launch notes"
+          },
+          {
+            "name": "r/ROS",
+            "for": "ROS 2 results and tools",
+            "format": "Text post, clip or plot in the body, link at the end.",
+            "flair": "the project or showcase flair on the submit form",
+            "verified": false,
+            "source": "a 2026 launch playbook, not the rules page"
+          },
+          {
+            "name": "r/reinforcementlearning",
+            "for": "RL and imitation-learning results and evaluation method",
+            "format": "Text post asking for critique of the method.",
+            "flair": "project",
+            "verified": false,
+            "source": "memory only"
+          },
+          {
+            "name": "r/computervision",
+            "for": "perception results only",
+            "format": "Text post with the plot.",
+            "flair": "Showcase",
+            "verified": false,
+            "source": "memory only"
+          },
+          {
+            "name": "r/learnmachinelearning",
+            "for": "a lesson with numbers, not a launch",
+            "format": "Title starts with [P].",
+            "flair": "Project",
+            "verified": false,
+            "source": "2026 post titles"
+          }
+        ],
+        "never": [
+          "r/cscareerquestionsUK",
+          "r/UniUK"
+        ],
+        "verify": "Before the first post in a subreddit, open About > Rules, fix this entry and set verified to true. Reddit could not be read directly when the list was made."
+      },
+      "instagram": {
+        "use": "sometimes: only an item that already has a video, a GIF or a plot",
+        "max_per_run": 1,
+        "caption_max_chars": 2200,
+        "hashtags_max": 5,
+        "first_line_chars": 125,
+        "links": "Caption links do not click. Write 'link in bio' once and the repository as plain text. A Story link sticker does click.",
+        "media": "Reel at 9:16, 1080x1920, 10 to 45 seconds and never over 3 minutes, or it is not shown to non-followers. Instagram will not play a GIF, so convert it to MP4. Carousel up to 20 items at 4:5, 1080x1350."
       },
       "linkedin": {
-        "only_for": "milestones",
+        "use": "rarely: milestones only",
         "max_per_run": 1,
         "max_chars": 3000,
-        "target_words": [60, 200],
-        "hashtags_max": 3
+        "first_line_chars": 140,
+        "target_words": [
+          60,
+          200
+        ],
+        "hashtags_max": 3,
+        "links": "Link in a first comment posted straight away, or in the body for a launch. Never add a link by editing later.",
+        "media": "A PDF document post of 5 to 8 pages suits a result: headline number and plot first, repository last. Native video 3 seconds to 15 minutes; a GIF up to 250 frames plays as it is."
       }
     }
   },

@@ -1,8 +1,9 @@
 # auto-post
 
 Drafts posts about Akbar Juraev's work from what changes in his public GitHub repositories.
-Three times a week it works out what is new, writes X posts (and a LinkedIn post for the rare
-milestone), and opens them as a GitHub issue to review, copy and post by hand.
+Three times a week it works out what is new, writes X posts, plus a Reddit, Instagram or
+LinkedIn version when an item suits one, and opens them as a GitHub issue to review, copy and
+post by hand.
 
 This file is the entry point for every assistant, whichever vendor. `CLAUDE.md` only points
 here. Read this, then `rules.md`, and you know the whole repository.
@@ -28,7 +29,8 @@ wire it to a posting API without being asked in so many words.
 | --- | --- | --- |
 | `rules.md` | the procedure: what is worth a post, the voice, the output format | the owner, rarely |
 | `config.json` | who, links, which repositories count, platform limits, facts that must match | the owner, whenever a fact changes |
-| `scan.py` | the deterministic half: what is new, the issue body, X length checks. Standard library only | only to fix a bug, with a test |
+| `scan.py` | the deterministic half: what is new, the issue body, each platform's length and hashtag checks. Standard library only | only to fix a bug, with a test |
+| `x-tlds.txt` | the top-level domains X turns into links, from twitter-text, so X posts are counted as X counts them | only to refresh from a newer twitter-text |
 | `draft.py` | the judgement half: sends rules, config and digest to a model, prints drafts | only to change provider or model |
 | `.github/workflows/post-drafts.yml` | the schedule: Monday, Wednesday, Friday 07:30 UTC | rarely |
 
@@ -45,7 +47,7 @@ python3 scan.py scan --json --out digest.json    # the same, for draft.py or an 
 python3 scan.py scan --since 2026-09-15T00:00:00Z
 python3 draft.py digest.json --dry-run           # the exact prompt, no key needed
 python3 draft.py digest.json > raw.md            # needs anthropic and ANTHROPIC_API_KEY
-python3 scan.py check raw.md                     # flags X posts over the limit, drops em dashes
+python3 scan.py check raw.md                     # flags posts over their platform's limits, drops em dashes
 python3 scan.py compose digest.json --drafts raw.md   # the issue body
 python3 scan.py selftest                         # the checks behind all of the above
 ```

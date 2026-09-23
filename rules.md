@@ -90,29 +90,61 @@ Taken from how the README, the site and the LinkedIn profile are already written
 
 ## 6. Platforms
 
-`posts.primary` in `config.json` is where every item goes. Today that is X.
+Four platforms, each with its own job. What each one is for, its limits and its media advice
+live under `posts.platforms` in `config.json`; read the `use` line of each before deciding.
 
-**X, every item.**
+**X, every item.** The regular one.
 
 - One post within `max_chars`, or a thread of at most `thread_max_posts` when the result needs
   setup. The first post must stand on its own: the result, and why it is surprising.
-- When `link_in_reply` is true the link goes in a reply, not the main post, because X shows
-  posts carrying an outside link to fewer people. Write that reply too.
-- Suggest one thing to attach: a plot or GIF that is already in the repository (the digest's
-  README often names one), or what to screenshot or record. Posts with an image or a short clip
-  travel much further than text.
-- Keep it plain enough to paste unchanged into everything in `also_fits`.
+- When `link_in_reply` is true the main post carries the result and the media, and the link goes
+  in a reply. X says links are no longer held back, but a post that leads with a link still gets
+  far less engagement than one that leads with the result. Write that reply too.
+- File names count as links on X: `scan.py` or `README.md` costs 23 characters. Name a file only
+  when it matters; `scan.py check` counts it the way X does.
+- Suggest one thing to attach, following `x.media`: a plot or a clip that is already in the
+  repository, or what to screenshot or record.
+
+**Reddit, sometimes.** Only for a measured result, a release or a launch, and only when an entry
+in `reddit.subreddits` fits it. At most `reddit.max_per_run`. Never a subreddit in
+`reddit.never`.
+
+- Name the subreddit and its flair, and follow that entry's `format`. If its `verified` is
+  false, say so in one line: the rules page has to be read before posting there.
+- A text post, never a bare link. Title: the finding with its number and conditions, in plain
+  words. Body, in this order: one line saying it is your project, the result in two sentences,
+  the setup (hardware, software versions, n, seeds), the method, the numbers, what surprised you
+  or what you would do differently, then the link as the last line.
+- Several of these subreddits remove posts that read as written by a model, and r/opensource
+  bans them outright. Write the body as short, plain, factual lines for the owner to put in his
+  own words, and put `Rewrite this in your own words before posting.` above it.
+- Nothing that asks for upvotes, anywhere. That is vote manipulation on Reddit.
+- Otherwise `Reddit: skip`.
+
+**Instagram, sometimes.** Only when the item already has a video, a GIF or a plot, per
+`instagram.use`. At most `instagram.max_per_run`.
+
+- Say which file to use and whether it is a Reel or a carousel, following `instagram.media`.
+- The first `first_line_chars` characters show before "more", so the result goes there.
+- Caption links do not click: write `link in bio` once and the repository as plain text.
+- Hashtags within `hashtags_max`, specific ones, at the end.
+- Otherwise `Instagram: skip`.
 
 **LinkedIn, milestones only.** A paper submitted or accepted, a release, a new project with a
 headline result, a launch, or a role change that `config.json` facts state. At most
-`linkedin.max_per_run` per run. Otherwise write `LinkedIn: skip` and nothing else for it.
+`linkedin.max_per_run`. The first `first_line_chars` characters carry the result. Handle the
+link as `linkedin.links` says. Otherwise `LinkedIn: skip`.
+
+**Asking for support.** Only for a launch, and only as a concrete ask that fits the product:
+"try it and tell me which boards are missing", not "please like and share". Never ask for votes
+on Reddit or for likes anywhere.
 
 ## 7. Output format
 
 Markdown, because it lands in a GitHub issue. Put every post in its own fenced block so it has
-a copy button, and use the block names below exactly: `scan.py check` measures every
-`x-post` and `x-reply` block and flags any that are too long. Nothing outside this shape: no
-preamble, no closing summary, no offer to help further.
+a copy button, and use the block names below exactly: `scan.py check` measures each block
+against its platform's limits in `config.json` and flags any that break them. Nothing outside
+this shape: no preamble, no closing summary, no offer to help further.
 
 ````
 ## 1. <a few words naming the result>
@@ -131,6 +163,22 @@ preamble, no closing summary, no offer to help further.
 <reply carrying the link>
 ```
 **Attach:** <the file in the repository, or what to capture>
+
+**Reddit:** <r/subreddit>, flair <flair>
+```reddit-title
+<title>
+```
+Rewrite this in your own words before posting.
+```reddit-body
+<the body, as short factual lines>
+```
+(or the single line `Reddit: skip`)
+
+**Instagram:** <Reel or carousel>, using <file>
+```instagram
+<caption>
+```
+(or the single line `Instagram: skip`)
 
 **LinkedIn**
 ```linkedin
@@ -156,3 +204,6 @@ procedure changes here. Changing behaviour in either place should not require to
 ## 9. Change log
 
 - 2026-09-22: created. X first, LinkedIn for milestones only, links in the reply.
+- 2026-09-23: Reddit and Instagram added as occasional platforms, with a checked list of
+  subreddits. X link advice reworded after X said links are no longer held back. Bluesky,
+  Threads and Mastodon dropped: not used.
