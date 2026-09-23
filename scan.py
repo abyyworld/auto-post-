@@ -137,13 +137,13 @@ class GitHub:
             raise
         return json.loads(body)
 
-    def get_all(self, path, params=None):
-        """Every page, following the Link header."""
-        items, url, query = [], path, dict(params or {}, per_page=100)
-        while url:
+    def get_all(self, path, params=None, max_pages=None):
+        """Every page, following the Link header, or the first max_pages of them."""
+        items, url, query, pages = [], path, dict(params or {}, per_page=100), 0
+        while url and (max_pages is None or pages < max_pages):
             body, link = self._request(url, query)
             items.extend(json.loads(body))
-            url, query = next_link(link), None
+            url, query, pages = next_link(link), None, pages + 1
         return items
 
     def readme(self, owner, repo):
@@ -278,6 +278,11 @@ def eligible_repos(repos, config):
     return eligible, skipped
 
 
+def repo_key(repo):
+    """Heads are recorded under the repository's id, which a rename does not change."""
+    return str(repo.get("id") or repo["name"])
+
+
 def touched_since(repo, since):
     """pushed_at moves on a push to any branch, so it is a safe first filter."""
     moments = [parse_time(repo.get(key)) for key in ("pushed_at", "created_at")]
@@ -317,45 +322,82 @@ def current_head(github, repo):
     return latest[0]["sha"] if latest else None
 
 
+PAGE = 100            # commits per request
+WHOLE_PAGES = 5       # a new repository's history is read up to 500 commits deep
+
+
 def commit_key(commit):
-    """What survives a history rewrite that only touches messages or committers."""
-    author = (commit.get("commit") or {}).get("author") or {}
-    message = ((commit.get("commit") or {}).get("message") or "").strip()
-    return author.get("name"), author.get("date"), message.partition("\n")[0].strip()
+    """What a message-only rewrite leaves alone: the author date and the tree.
+
+    Rewording, stripping trailers and remapping author names (filter-repo,
+    filter-branch, rebase reword, amend) all keep both, so a rewritten copy of a
+    commit already reported is recognised even when its subject changed.
+    """
+    data = commit.get("commit") or {}
+    tree = (data.get("tree") or {}).get("sha")
+    return (data.get("author") or {}).get("date"), tree or (data.get("message") or "").strip()
+
+
+def authored(commit):
+    return parse_time(((commit.get("commit") or {}).get("author") or {}).get("date"))
 
 
 def new_commits(github, repo, since, previous, whole_history=False):
-    """Return (commits newest first, head sha, how they were found, how many there are).
+    """Return (commits newest first, head sha, how they were found, count, count_complete).
 
-    From the previous head when there is one: everything the branch gained since. If the
-    history was rewritten under it, the rewritten copies of commits already seen are
-    recognised by author, date and subject and left out. With no usable head, a new
-    repository gives its whole history and any other gives the commits dated in the window.
+    With a previous head: what the branch gained since, from the compare when it has a
+    common ancestor, else from the branch's own recent history. Either way, commits whose
+    identity (commit_key) is already in the previous head's history are copies from a
+    rewrite and are left out. With no previous head, a new repository gives its whole
+    history and any other gives the commits dated in the window.
     """
     branch, name = repo["default_branch"], repo["full_name"]
+    path = "/repos/%s/commits" % name
     if previous:
         compared = github.get("/repos/%s/compare/%s...%s" % (name, previous, branch))
-        if compared:
-            commits = compared.get("commits") or []
-            total = compared.get("total_commits", len(commits))
-            complete = total <= len(commits)
-            if compared.get("status") in ("ahead", "identical"):
-                head = (commits[-1]["sha"] if commits else previous) if complete else current_head(github, repo)
-                return list(reversed(commits)), head, "since last head", total
-            back = github.get("/repos/%s/compare/%s...%s" % (name, branch, previous)) if complete else None
-            if compared.get("status") == "diverged" and back and \
-                    back.get("total_commits", 0) <= len(back.get("commits") or []):
-                seen = {commit_key(commit) for commit in back.get("commits") or []}
-                fresh = [commit for commit in commits if commit_key(commit) not in seen]
-                head = commits[-1]["sha"] if commits else current_head(github, repo)
-                return list(reversed(fresh)), head, "since last head, history rewritten", len(fresh)
+        status = (compared or {}).get("status")
+        forward = (compared or {}).get("commits") or []
+        if status in ("ahead", "identical", "diverged") and \
+                compared.get("total_commits", len(forward)) <= len(forward):
+            candidates, complete = forward, True
+            head = forward[-1]["sha"] if forward else previous
+        else:
+            # No common ancestor (a rewritten root commit) or more than one page of change:
+            # read the branch itself and let identity sort old from new.
+            listing = github.get(path, {"sha": branch, "per_page": PAGE}, missing=[]) or []
+            candidates, complete = list(reversed(listing)), len(listing) < PAGE
+            head = listing[0]["sha"] if listing else current_head(github, repo)
+            status = "unrelated"
+        if not candidates:
+            return [], head, "since last head", 0, True
 
-    query = {"sha": branch, "per_page": 100}
-    if not whole_history:
-        query["since"] = format_time(since)
-    commits = github.get("/repos/%s/commits" % name, query, missing=[]) or []
+        old = github.get(path, {"sha": previous, "per_page": PAGE})
+        if old is None and status == "ahead":
+            fresh, method = candidates, "since last head"
+        elif old is None:
+            # The old head can no longer be read, so dates are all there is to go on.
+            fresh, method = [c for c in candidates if authored(c) and authored(c) >= since], \
+                "since last head, by date"
+        else:
+            seen, fresh = {commit_key(c) for c in old}, []
+            for commit in candidates:
+                key = commit_key(commit)
+                if key not in seen:
+                    seen.add(key)
+                    fresh.append(commit)
+            method = "since last head" if len(fresh) == len(candidates) and status == "ahead" \
+                else "since last head, history rewritten"
+        return list(reversed(fresh)), head, method, len(fresh), complete
+
+    if whole_history:
+        commits = github.get_all(path, {"sha": branch}, max_pages=WHOLE_PAGES)
+        complete, method = len(commits) < PAGE * WHOLE_PAGES, "whole history"
+    else:
+        commits = github.get(path, {"sha": branch, "since": format_time(since), "per_page": PAGE},
+                             missing=[]) or []
+        complete, method = len(commits) < PAGE, "dated in window"
     head = commits[0]["sha"] if commits else current_head(github, repo)
-    return commits, head, "whole history" if whole_history else "dated in window", len(commits)
+    return commits, head, method, len(commits), complete
 
 
 def releases_in_window(github, repo, since, now):
@@ -379,9 +421,9 @@ def repo_changes(github, repo, config, since, now, previous, whole_history=False
     """Return (what happened in the window [since, now) or None, the head to remember)."""
     scan = config["scan"]
     limit = scan["max_commits_per_repo"]
-    raw, head, method, total = new_commits(github, repo, since, previous, whole_history)
+    raw, head, method, total, complete = new_commits(github, repo, since, previous, whole_history)
     kept = [summarise_commit(c) for c in raw if keep_commit(c, scan["ignore_authors"])]
-    count = len(kept) + max(total - len(raw), 0)  # commits beyond what one request returned
+    count = len(kept) + max(total - len(raw), 0)
     if releases is None:
         releases = releases_in_window(github, repo, since, now)
 
@@ -403,7 +445,8 @@ def repo_changes(github, repo, config, since, now, previous, whole_history=False
         "is_new": is_new,
         "found_by": method,
         "commit_count": count,
-        "commits_capped": count > min(len(kept), limit),
+        "count_complete": complete,
+        "commits_capped": count > min(len(kept), limit) or not complete,
         "commits": kept[:limit],
         "releases": releases,
         "readme": clip(github.readme(repo["owner"]["login"], repo["name"]), scan["readme_chars"]),
@@ -437,7 +480,7 @@ def build_digest(github, config, override=None, now=None):
     skipped["unchanged"] = 0
     repos, new_heads = [], {}
     for repo in eligible:
-        name = repo["name"]
+        name = repo_key(repo)
         previous = heads.get(name)
         # A repository created since start_from with no recorded head is read whole, so a
         # project pushed with its local history, or first seen while empty, loses nothing.
@@ -493,7 +536,7 @@ def render(digest, max_commits=None, max_repos=None, markdown=False):
     shown = digest["repos"] if max_repos is None else digest["repos"][:max_repos]
     for repo in shown:
         tags = ["new repository"] if repo["is_new"] else []
-        tags.append(plural(repo["commit_count"], "commit"))
+        tags.append(plural(repo["commit_count"], "commit") + ("" if repo.get("count_complete", True) else " or more"))
         if repo["releases"]:
             tags.append(plural(len(repo["releases"]), "release"))
         lines.append("### [%s](%s)  (%s)" % (repo["name"], repo["url"], ", ".join(tags)))
@@ -505,7 +548,8 @@ def render(digest, max_commits=None, max_repos=None, markdown=False):
         for commit in commits:
             lines.append("- `%s` %s" % (commit["sha"], line(commit["subject"], 200)))
         if repo["commit_count"] > len(commits):
-            lines.append("- and %d more" % (repo["commit_count"] - len(commits)))
+            lines.append("- and %d more%s" % (repo["commit_count"] - len(commits),
+                                               "" if repo.get("count_complete", True) else " at least"))
         lines.append("")
     if len(shown) < len(digest["repos"]):
         lines.append("And %s more with changes." % plural(len(digest["repos"]) - len(shown), "repository"))
@@ -777,16 +821,21 @@ class FakeGitHub:
             # As GitHub does: newest first, one page of per_page, pull requests included.
             page = sorted(page, key=lambda item: item["created_at"], reverse=True)
             page = page[:params.get("per_page", 30)]
-        if path.endswith("/commits") and page:
-            # As GitHub does: since filters by date, one page of per_page.
-            if params.get("since"):
-                page = [c for c in page if parse_time(c["commit"]["author"]["date"]) >= parse_time(params["since"])]
-            page = page[:params.get("per_page", 30)]
+        if path.endswith("/commits"):
+            # As GitHub does: history from the ref asked for, since filtering on the
+            # committer date, one page of per_page.
+            page = self.pages.get("%s@%s" % (path, params.get("sha")), page)
+            if page and params.get("since"):
+                page = [c for c in page if parse_time((c["commit"].get("committer") or c["commit"]["author"])["date"])
+                        >= parse_time(params["since"])]
+            if page:
+                page = page[:params.get("per_page", 30)]
         return page
 
-    def get_all(self, path, params=None):
+    def get_all(self, path, params=None, max_pages=None):
         self.calls.append(path)
-        return self.pages.get(path, [])
+        page = self.pages.get("%s@%s" % (path, (params or {}).get("sha")), self.pages.get(path, []))
+        return page if max_pages is None else page[:100 * max_pages]
 
     def readme(self, owner, repo):
         return self.readmes.get(repo, "")
@@ -816,10 +865,12 @@ def selftest():
                      "default_branch": "main", "pushed_at": pushed, "created_at": created,
                      "html_url": "https://github.com/me/" + name}, **extra)
 
-    def commit(sha, message, login="me", parents=1, name="Me", date="2026-09-20T09:00:00Z"):
+    def commit(sha, message, login="me", parents=1, name="Me", date="2026-09-20T09:00:00Z", tree=None):
+        # A rewritten copy keeps its original's author date and tree; give both the same tree.
         return {"sha": sha * 7, "html_url": "u", "parents": [{}] * parents,
                 "author": {"login": login} if login else None,
-                "commit": {"message": message, "author": {"name": name, "date": date}}}
+                "commit": {"message": message, "author": {"name": name, "date": date},
+                           "tree": {"sha": tree or "tree-" + sha}}}
 
     def issue(created, state=None, **extra):
         body = "drafts" + ("\n" + write_marker(state) if state is not None else "")
@@ -915,9 +966,13 @@ def selftest():
         ],
         "/repos/me/released/commits": [],
         # history rewritten: compare says diverged, so fall back to the dated list
+        # history rewritten: the copies of old commits keep their author dates and trees
         "/repos/me/rewritten/compare/rrrrrrr...main": {"status": "diverged", "commits": [
-            commit(str(i), "old %d" % i, date="2026-01-01T00:00:00Z") for i in range(9)]},
-        "/repos/me/rewritten/commits": [commit("k", "Rewrite trailers out")],
+            commit(str(i), "old %d, trailer stripped" % i, date="2026-01-0%dT00:00:00Z" % (i + 1), tree="t%d" % i)
+            for i in range(9)] + [commit("k", "Rewrite trailers out")]},
+        "/repos/me/rewritten/commits@rrrrrrr": [
+            commit(chr(97 + i), "old %d" % i, date="2026-01-0%dT00:00:00Z" % (i + 1), tree="t%d" % i)
+            for i in reversed(range(9))],
         "/repos/me/never-seen/commits": [commit("n", "Initial")],
     }
     github = FakeGitHub(pages, {"results": "R" * 30})
@@ -930,8 +985,9 @@ def selftest():
     check("a merged branch is found through the recorded head",
           [c["subject"] for c in by_name["merged"]["commits"]], ["Add the latency benchmark"])
     check("and is labelled as such", by_name["merged"]["found_by"], "since last head")
-    check("a rewritten head falls back to dates",
-          [c["subject"] for c in by_name["rewritten"]["commits"]], ["Rewrite trailers out"])
+    check("a rewritten history is recognised by identity and only the new commit is kept",
+          ([c["subject"] for c in by_name["rewritten"]["commits"]], by_name["rewritten"]["found_by"]),
+          (["Rewrite trailers out"], "since last head, history rewritten"))
     check("merge left out, list capped and counted",
           ([c["subject"] for c in by_name["results"]["commits"]], by_name["results"]["commit_count"],
            by_name["results"]["commits_capped"]),
@@ -993,13 +1049,13 @@ def selftest():
 
     last = issue("2026-09-25T07:35:00Z", {"until": "2026-09-25T07:34:00Z", "heads": {"proj": "p" * 7}})
     old_p = commit("p", "Tune the controller", date="2026-09-24T10:00:00Z")
-    amended = dict(commit("P", "Tune the controller\n\nReworded body.", date="2026-09-24T10:00:00Z"))
+    amended = commit("P", "Tune the controller, reworded", date="2026-09-24T10:00:00Z", tree="tree-p")
     pr_work = commit("w", "Add the grasp benchmark", date="2026-09-24T12:00:00Z")
     merge = commit("m", "Merge pull request #7", parents=2, date="2026-09-26T10:00:00Z")
     rewritten = build_digest(world({
         "/repos/me/proj/compare/ppppppp...main": {"status": "diverged", "total_commits": 3,
                                                   "commits": [amended, pr_work, merge]},
-        "/repos/me/proj/compare/main...ppppppp": {"status": "diverged", "total_commits": 1, "commits": [old_p]},
+        "/repos/me/proj/commits@ppppppp": [old_p],
     }, [repo("proj", pushed="2026-09-26T10:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
     check("a force-push in the same window as a merge keeps the merged work and drops rewritten copies",
           (subjects(rewritten), rewritten["state"]["heads"].get("proj")),
@@ -1051,12 +1107,64 @@ def selftest():
     big = build_digest(world({
         "/repos/me/proj/compare/ppppppp...main": {"status": "ahead", "total_commits": 300,
                                                   "commits": [commit("s", "step %d" % i) for i in range(250)]},
-        "/repos/me/proj/commits": [commit("T", "the tip")]},
+        "/repos/me/proj/commits@main": [commit("T", "the tip")] + [commit("s%d" % i, "step %d" % i)
+                                                                    for i in range(298, 199, -1)],
+        "/repos/me/proj/commits@ppppppp": [commit("p", "before")]},
         [repo("proj", pushed="2026-09-26T10:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
-    check("more than one page of new commits counts them all and records the real tip",
-          ((big["repos"] or [{}])[0].get("commit_count"), (big["repos"] or [{}])[0].get("commits_capped"),
+    check("more than a page of new commits records the real tip and says the count is a lower bound",
+          ((big["repos"] or [{}])[0].get("commit_count"), (big["repos"] or [{}])[0].get("count_complete"),
            big["state"]["heads"].get("proj")),
-          (300, True, "T" * 7))
+          (100, False, "T" * 7))
+
+    root = commit("r", "Start the planner", date="2026-09-10T09:00:00Z", tree="t-root")
+    history_old = [old_p, root]
+    root_copy = commit("R", "Start the planner (trailers stripped)", date="2026-09-10T09:00:00Z", tree="t-root")
+    p_copy = commit("Q", "Tune the controller", date="2026-09-24T10:00:00Z", tree="tree-p")
+    pr_early = commit("e", "Grasp bench: 120 trials", date="2026-09-24T09:00:00Z")
+    pr_late = commit("f", "Grasp bench: 81% success", date="2026-09-24T19:00:00Z")
+    merged_after = commit("M", "Merge pull request #9", parents=2, date="2026-09-26T10:00:00Z")
+    reroot = build_digest(world({  # no compare page: GitHub answers 404, no common ancestor
+        "/repos/me/proj/commits@main": [merged_after, pr_late, pr_early, p_copy, root_copy],
+        "/repos/me/proj/commits@ppppppp": history_old,
+    }, [repo("proj", pushed="2026-09-26T12:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("a rewrite of the root commit keeps the work merged in the same window, and only that",
+          (subjects(reroot), reroot["state"]["heads"].get("proj")),
+          (["Grasp bench: 81% success", "Grasp bench: 120 trials"], "M" * 7))
+
+    reexposed = build_digest(world({  # a PR cut before the rewrite, merged after: compare says ahead
+        "/repos/me/proj/compare/ppppppp...main": {"status": "ahead", "total_commits": 3,
+                                                  "commits": [p_copy, pr_work, merge]},
+        "/repos/me/proj/commits@ppppppp": history_old,
+    }, [repo("proj", pushed="2026-09-26T10:00:00Z")], [last]), config, now=t("2026-09-28T07:34:00Z"))
+    check("rewritten copies brought back by a merge are not reported again",
+          subjects(reexposed), ["Add the grasp benchmark"])
+
+    readme_first = issue("2026-09-25T07:35:00Z", {"until": "2026-09-25T07:34:00Z", "heads": {"grasp-sim": "i" * 7}})
+    replaced = build_digest(world({  # GitHub made a README commit; the local history was force-pushed over it
+        "/repos/me/grasp-sim/commits@main": local,
+        "/repos/me/grasp-sim/commits@iiiiiii": [commit("i", "Initial commit", date="2026-09-24T11:00:00Z")],
+    }, [repo("grasp-sim", pushed="2026-09-26T12:00:00Z", created="2026-09-24T11:00:00Z")], [readme_first]),
+        config, now=t("2026-09-28T07:34:00Z"))
+    check("local history force-pushed over a new repository's first commit is reported",
+          subjects(replaced), ["Write the README", "Success rate 81% over 120 trials"])
+
+    renamed_issue = issue("2026-09-25T07:35:00Z", {"until": "2026-09-25T07:34:00Z", "heads": {"42": "z" * 7}})
+    renamed = build_digest(world({
+        "/repos/me/new-name/compare/zzzzzzz...main": {"status": "identical", "total_commits": 0, "commits": []},
+        "/repos/me/new-name/commits": local,
+    }, [repo("new-name", id=42, pushed="2026-09-26T12:00:00Z", created="2026-09-20T11:00:00Z")],
+        [renamed_issue]), config, now=t("2026-09-28T07:34:00Z"))
+    check("renaming a repository does not make it read whole again",
+          ([r["name"] for r in renamed["repos"]], renamed["state"]["heads"]), ([], {"42": "z" * 7}))
+
+    long_history = [commit("h%d" % i, "step %d" % i, date="2026-09-26T%02d:%02d:00Z" % (i // 60, i % 60))
+                    for i in range(149, -1, -1)]
+    deep = build_digest(world({"/repos/me/deep/commits@main": long_history},
+                              [repo("deep", pushed="2026-09-26T12:00:00Z", created="2026-09-26T11:00:00Z")], [last]),
+                        config, now=t("2026-09-28T07:34:00Z"))
+    check("a new repository with more than a page of history is counted in full",
+          ((deep["repos"] or [{}])[0].get("commit_count"), (deep["repos"] or [{}])[0].get("count_complete")),
+          (150, True))
 
     markerless = dict(issue("2026-09-27T07:00:00Z"), body="edited by hand")
     check("an issue whose marker was edited away does not hide the heads before it",
