@@ -17,7 +17,7 @@ Standard library only, so any machine with Python 3 can run it.
     python3 scan.py render digest.json     print a saved digest as Markdown
     python3 scan.py compose digest.json --drafts drafts.md
                                            the issue body: state marker, drafts, digest
-    python3 scan.py check drafts.md        measure every X post, flag any over the limit
+    python3 scan.py check drafts.md        measure every post against its platform's limits
     python3 scan.py selftest               run the built in tests
 
 How "new" is decided. Every drafts issue carries a hidden marker with the time of its
@@ -447,8 +447,9 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
 
 # ----------------------------------------------------------------- checking drafts
 
-POST_BLOCK = re.compile(r"^```(x-post|x-reply)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
+POST_BLOCK = re.compile(r"^```([a-z-]+)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
 URL = re.compile(r"https?://\S+")
+HASHTAG = re.compile(r"(?<![\w&#/])#(?=\w*[^\W\d])\w+")
 NARROW = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 
 
@@ -458,20 +459,45 @@ def x_length(text):
     return sum(1 if any(low <= ord(ch) <= high for low, high in NARROW) else 2 for ch in text)
 
 
-def check_drafts(text, limit):
-    """Swap em dashes for commas and flag any X post that is over the limit.
+# Each block name in rules.md section 7, the platform in config.json it belongs to, the
+# key holding its length limit there, and how that platform counts characters.
+BLOCKS = {
+    "x-post": ("x", "max_chars", x_length),
+    "x-reply": ("x", "max_chars", x_length),
+    "reddit-title": ("reddit", "title_max_chars", len),
+    "reddit-body": ("reddit", "body_max_chars", len),
+    "instagram": ("instagram", "caption_max_chars", len),
+    "linkedin": ("linkedin", "max_chars", len),
+}
 
-    Counting characters is the part a model gets wrong, so it is done here and the
-    result is written under the post it applies to.
+
+def block_problems(kind, body, platforms):
+    """What is wrong with one block, as sentences. Empty when it is fine."""
+    if kind not in BLOCKS or BLOCKS[kind][0] not in platforms:
+        return []
+    platform, key, count = BLOCKS[kind]
+    settings = platforms[platform]
+    problems = []
+    length, limit = count(body), settings.get(key)
+    if limit is not None and length > limit:
+        problems.append("Over the limit: %d of %d characters. Trim before posting." % (length, limit))
+    tags, allowed = len(HASHTAG.findall(body)), settings.get("hashtags_max")
+    if allowed is not None and tags > allowed:
+        problems.append("%s: the rules allow %d." % (plural(tags, "hashtag"), allowed))
+    return problems
+
+
+def check_drafts(text, platforms):
+    """Swap em dashes for commas and flag any post that breaks its platform's limits.
+
+    Counting characters and hashtags is the part a model gets wrong, so it is done here
+    and the result is written under the block it applies to.
     """
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")
 
     def annotate(found):
-        length = x_length(found.group(2).strip())
-        if length <= limit:
-            return found.group(0)
-        return "%s\n> Over the limit: %d of %d characters. Trim before posting." % (
-            found.group(0), length, limit)
+        problems = block_problems(found.group(1), found.group(2).strip(), platforms)
+        return "\n".join([found.group(0)] + ["> " + problem for problem in problems])
 
     return POST_BLOCK.sub(annotate, text)
 
@@ -673,14 +699,40 @@ def selftest():
     check("plain text counts one per character", x_length("abc def"), 7)
     check("a link counts 23 whatever its length", x_length("see https://github.com/me/a-very-long-name"), 27)
     check("emoji count two", x_length("\U0001F916"), 2)
-    long_post = "```x-post\n" + "a" * 281 + "\n```"
-    ok_post = "```x-reply\nCode and data: https://github.com/me/" + "b" * 300 + "\n```"
-    checked = check_drafts("Intro \u2014 here.\n\n" + long_post + "\n\n" + ok_post + "\n", 280)
-    check("an over-long post is flagged", "Over the limit: 281 of 280" in checked, True)
-    check("a long link does not trip the limit", checked.count("Over the limit"), 1)
+    platforms = {
+        "x": {"max_chars": 280, "hashtags_max": 0},
+        "reddit": {"title_max_chars": 300, "body_max_chars": 1000},
+        "instagram": {"caption_max_chars": 2200, "hashtags_max": 5},
+        "linkedin": {"max_chars": 3000, "hashtags_max": 3},
+    }
+
+    def block(kind, body):
+        return "```%s\n%s\n```" % (kind, body)
+
+    checked = check_drafts("Intro \u2014 here.\n\n" + block("x-post", "a" * 281) + "\n\n"
+                           + block("x-reply", "Code: https://github.com/me/" + "b" * 300) + "\n", platforms)
+    check("an over-long X post is flagged", "> Over the limit: 281 of 280" in checked, True)
+    check("a long link does not trip the X limit", checked.count("Over the limit"), 1)
     check("em dashes become commas", ("\u2014" in checked, "Intro, here." in checked), (False, True))
-    check("a LinkedIn block is never measured against X",
-          "Over the limit" in check_drafts("```linkedin\n" + "a" * 900 + "\n```", 280), False)
+    check("a LinkedIn post is measured against LinkedIn, not X",
+          "Over the limit" in check_drafts(block("linkedin", "a" * 900), platforms), False)
+    check("an over-long LinkedIn post is flagged",
+          "3001 of 3000" in check_drafts(block("linkedin", "a" * 3001), platforms), True)
+    check("a Reddit title is measured on its own",
+          ("301 of 300" in check_drafts(block("reddit-title", "t" * 301), platforms),
+           "Over" in check_drafts(block("reddit-body", "b" * 999), platforms)), (True, False))
+    check("an Instagram caption is measured", "2201 of 2200" in check_drafts(block("instagram", "c" * 2201), platforms), True)
+    tagged = check_drafts(block("instagram", "Grasping in sim. #robotics #ros2 #mujoco #ai #ml #cv"), platforms)
+    check("too many hashtags are flagged", "> 6 hashtags: the rules allow 5." in tagged, True)
+    check("any hashtag on X is flagged when none are allowed",
+          "1 hashtag: the rules allow 0." in check_drafts(block("x-post", "Result. #robotics"), platforms), True)
+    check("an issue number, a URL fragment and C# are not hashtags",
+          HASHTAG.findall("PR #4, see https://x.com/a#b, written in C#"), [])
+    check("an unknown block or an unconfigured platform is left alone",
+          check_drafts(block("text", "a" * 5000) + block("instagram", "a" * 5000), {"x": {"max_chars": 280}}),
+          block("text", "a" * 5000) + block("instagram", "a" * 5000))
+    two = check_drafts(block("x-post", "a" * 300 + " #one"), platforms)
+    check("every problem gets its own line", (two.count("\n> "), two.endswith("allow 0.")), (2, True))
 
     if failures:
         print("FAIL %d of %d" % (len(failures), len(ran)))
@@ -713,7 +765,7 @@ def main(argv=None):
     body.add_argument("digest")
     body.add_argument("--drafts", help="file holding the drafts; omit when there are none")
 
-    measure = commands.add_parser("check", help="flag X posts over the limit, drop em dashes")
+    measure = commands.add_parser("check", help="flag posts over their platform's limits, drop em dashes")
     measure.add_argument("drafts")
 
     commands.add_parser("selftest", help="run the built in tests")
@@ -732,8 +784,8 @@ def main(argv=None):
 
     config = load_config(args.config)
     if args.command == "check":
-        limit = config["posts"]["platforms"]["x"]["max_chars"]
-        print(check_drafts(Path(args.drafts).read_text(encoding="utf-8"), limit), end="")
+        print(check_drafts(Path(args.drafts).read_text(encoding="utf-8"),
+                           config["posts"]["platforms"]), end="")
         return 0
 
     github = GitHub(token_from_env())
