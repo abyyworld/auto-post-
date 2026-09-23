@@ -80,6 +80,14 @@ def clip(text, limit):
     return text
 
 
+def inline(text, limit):
+    """Text for one Markdown line: no line breaks, no HTML tags, no code fences, at most limit."""
+    text = " ".join((text or "").split())
+    if len(text) > limit:
+        text = text[:limit].rstrip() + "..."
+    return text.replace("&", "&amp;").replace("<", "&lt;").replace(">", "&gt;").replace("`", "\\`")
+
+
 def plural(count, word):
     return "%d %s%s" % (count, word, "" if count == 1 else "s")
 
@@ -217,13 +225,17 @@ def previous_heads(issues, before=None):
     return {name: sha for name, sha in heads.items() if isinstance(sha, str)}
 
 
-def fetch_draft_issues(github, config, count):
+ISSUE_PAGE = 30  # one request; enough to find the issue a --since run needs
+
+
+def fetch_draft_issues(github, config):
+    """The newest drafts issues, newest first, pull requests left out."""
     return draft_issues(github.get("/repos/%s/issues" % config["issue"]["repo"], {
         "labels": config["issue"]["label"],
         "state": "all",
         "sort": "created",
         "direction": "desc",
-        "per_page": max(count, 1),
+        "per_page": ISSUE_PAGE,
     }, missing=[]))
 
 
@@ -372,9 +384,11 @@ def list_repos(github, config):
 def build_digest(github, config, override=None, now=None):
     now = now or datetime.now(timezone.utc)
     scan = config["scan"]
-    issues = fetch_draft_issues(github, config, scan["previous_drafts"])
+    issues = fetch_draft_issues(github, config)
     since, reason = resolve_since(config, issues, override)
+    # Compare from the heads current at the start of the window; carry forward the newest.
     heads = previous_heads(issues, before=since if override else None)
+    latest_heads = previous_heads(issues)
 
     eligible, skipped = eligible_repos(list_repos(github, config), config)
     skipped["unchanged"] = 0
@@ -390,7 +404,7 @@ def build_digest(github, config, override=None, now=None):
         else:
             # Nothing pushed, so the recorded head still stands. A repository seen for
             # the first time gets one lookup, so the next run can compare against it.
-            head = heads.get(name) or current_head(github, repo)
+            head = latest_heads.get(name) or heads.get(name) or current_head(github, repo)
             skipped["unchanged"] += 1
         if head:
             new_heads[name] = head
@@ -429,12 +443,13 @@ def render(digest, max_commits=None, max_repos=None):
             tags.append(plural(len(repo["releases"]), "release"))
         lines.append("### [%s](%s)  (%s)" % (repo["name"], repo["url"], ", ".join(tags)))
         if repo["description"]:
-            lines.append(clip(repo["description"], 300))
+            lines.append(inline(repo["description"], 300))
         for release in repo["releases"]:
-            lines.append("- release [%s](%s)" % (clip(release["name"], 200), release["url"]))
+            lines.append("- release [%s](%s)" % (inline(release["name"], 200).replace("]", "\\]"),
+                                                 release["url"]))
         commits = repo["commits"] if max_commits is None else repo["commits"][:max_commits]
         for commit in commits:
-            lines.append("- `%s` %s" % (commit["sha"], clip(commit["subject"], 200)))
+            lines.append("- `%s` %s" % (commit["sha"], inline(commit["subject"], 200)))
         if repo["commit_count"] > len(commits):
             lines.append("- and %d more" % (repo["commit_count"] - len(commits)))
         lines.append("")
@@ -490,6 +505,7 @@ def for_assistant(digest, limit):
     for step in steps:
         step(copy)
         text = json.dumps(copy, indent=1, ensure_ascii=False)
+        text = text.replace("<", "\\u003c").replace(">", "\\u003e")  # still the same JSON
         if len(text) <= limit:
             return text
     return None
@@ -511,7 +527,9 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
         head = drafts.strip()
         room = limit - len(marker) - 200
         if len(head) > room:
-            head = head[:room - len(TRUNCATED)].rstrip() + TRUNCATED
+            head = head[:room - len(TRUNCATED) - 4].rstrip() + TRUNCATED
+        if sum(1 for line in head.split("\n") if line.startswith("```")) % 2:
+            head += "\n```"  # close a fence left open, by the cut or by the model
         parts = [marker, head]
     else:
         head = ("No drafts this time: no model was available to write them. To get them, give any "
@@ -521,21 +539,25 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
         parts = [marker, head]
 
     used = sum(len(part) + 2 for part in parts) + 1
-    share = limit - used if drafts and drafts.strip() else (limit - used) * 2 // 5
-    changes = render_within(digest, share - len(details % ("What changed", "")))
-    if changes is not None:
-        parts.append(details % ("What changed", changes.strip()))
-        used += len(parts[-1]) + 2
-
+    digest_part = None
     if not (drafts and drafts.strip()):
-        wrapper = "```json\n%s\n```"
-        room = limit - used - len(details % ("Digest for an assistant", wrapper % "")) - 2
-        digest_json = for_assistant(digest, room)
+        wrapper = details % ("Digest for an assistant", "```json\n%s\n```")
+        room = limit - used - len(wrapper % "") - 2
+        reserve = min(6000, max(room, 0) // 4)  # the person's list is never starved
+        digest_json = for_assistant(digest, room - reserve)
         if digest_json is None:
             parts[1] += (" The digest was too large to include; run `python3 scan.py scan --json "
                          "--since %s` to get it." % digest["since"])
+            used += len(parts[1]) - len(head)
         else:
-            parts.append(details % ("Digest for an assistant", wrapper % digest_json))
+            digest_part = wrapper % digest_json
+            used += len(digest_part) + 2
+
+    changes = render_within(digest, limit - used - len(details % ("What changed", "")) - 2)
+    if changes is not None:
+        parts.append(details % ("What changed", changes.strip()))
+    if digest_part:
+        parts.append(digest_part)
 
     body = "\n\n".join(parts) + "\n"
     if len(body) > limit:  # only reachable through the note above; never cut the marker
@@ -545,10 +567,11 @@ def compose(digest, drafts=None, limit=ISSUE_LIMIT):
 
 # ----------------------------------------------------------------- checking drafts
 
-POST_BLOCK = re.compile(r"^```([a-z-]+)[^\n]*\n(.*?)\n```[ \t]*$", re.DOTALL | re.MULTILINE)
+FLAG = r"> (?:Over the limit: \d+ of \d+ characters\. Trim before posting\.|\d+ hashtags?: the rules allow \d+\.)"
+POST_BLOCK = re.compile(r"^```([a-z-]+)[^\n]*\n(.*?)\n```[ \t]*$((?:\n" + FLAG + r"[ \t]*(?=\n|\Z))*)",
+                        re.DOTALL | re.MULTILINE)
 HASHTAG = re.compile(r"(?<![\w&#/])#(?=\w*[^\W\d])\w+")
-ANNOTATION = re.compile(r"\n> (?:Over the limit: \d+ of \d+ characters\. Trim before posting\."
-                        r"|\d+ hashtags?: the rules allow \d+\.)(?=\n|$)")
+
 NARROW = ((0, 4351), (8192, 8205), (8208, 8223), (8242, 8247))
 X_LINK_LENGTH = 23
 
@@ -669,11 +692,14 @@ def check_drafts(text, platforms):
     """
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     text = text.replace(" \u2014 ", ", ").replace("\u2014", ", ")
-    text = ANNOTATION.sub("", text)  # a re-run replaces the old flags rather than stacking them
 
     def annotate(found):
-        problems = block_problems(found.group(1), found.group(2).strip(), platforms)
-        return "\n".join([found.group(0)] + ["> " + problem for problem in problems])
+        kind, body, old_flags = found.group(1), found.group(2), found.group(3)
+        if kind not in BLOCKS:
+            return found.group(0)
+        block = found.group(0)[:len(found.group(0)) - len(old_flags)]  # a re-run replaces old flags
+        problems = block_problems(kind, body.strip(), platforms)
+        return "\n".join([block] + ["> " + problem for problem in problems])
 
     return POST_BLOCK.sub(annotate, text)
 
@@ -688,7 +714,12 @@ class FakeGitHub:
 
     def get(self, path, params=None, missing=None):
         self.calls.append(path)
-        return self.pages.get(path, missing)
+        page = self.pages.get(path, missing)
+        if path.endswith("/issues") and page:
+            # As GitHub does: newest first, one page of per_page, pull requests included.
+            page = sorted(page, key=lambda item: item["created_at"], reverse=True)
+            page = page[:(params or {}).get("per_page", 30)]
+        return page
 
     def get_all(self, path, params=None):
         self.calls.append(path)
@@ -867,6 +898,22 @@ def selftest():
                          now=t("2026-09-21T08:00:00Z"))
     check("the recovery command in an oversized issue reproduces its digest",
           [r["name"] for r in again["repos"]], names)
+    crowded_issues = [issue("2026-09-2%dT07:00:00Z" % i, {"until": "2026-09-2%dT06:59:00Z" % i, "heads": {}},
+                            pull_request={}) for i in range(1, 10)]
+    paged = dict(replay)
+    paged["/repos/me/auto-post-/issues"] = replay["/repos/me/auto-post-/issues"] + crowded_issues
+    again = build_digest(FakeGitHub(paged, {"results": "R" * 30}), config, override=digest["since"],
+                         now=t("2026-09-21T08:00:00Z"))
+    check("recovery still finds the right heads when newer issues and pull requests crowd the page",
+          [(r["name"], r["found_by"], [c["subject"] for c in r["commits"]]) for r in again["repos"]],
+          [(r["name"], r["found_by"], [c["subject"] for c in r["commits"]]) for r in digest["repos"]])
+    carry = dict(pages)
+    carry["/repos/me/auto-post-/issues"] = [
+        issue("2026-09-10T07:01:00Z", {"until": "2026-09-10T07:00:00Z", "heads": {"quiet": "q" * 7}}),
+        issue("2026-09-14T07:01:00Z", {"until": "2026-09-14T07:00:00Z", "heads": {"quiet": "Q" * 7}})]
+    carried = build_digest(FakeGitHub(carry), config, override="2026-09-12T00:00:00Z", now=t("2026-09-21T07:00:00Z"))
+    check("a --since run carries an untouched repository's newest head, not an older one",
+          carried["state"]["heads"]["quiet"], "Q" * 7)
     check("the next window starts where this scan ended",
           resolve_since(config, [issue("2026-09-21T07:02:00Z", digest["state"])])[0],
           t("2026-09-21T07:00:00Z"))
@@ -912,6 +959,39 @@ def selftest():
     check("a shortened render says what it left out",
           ("and 37 more" in render_within(wide, 20000), "more with changes" in render_within(wide, 3000)),
           (True, True))
+    week = json.loads(json.dumps(digest))
+    week["repos"] = [dict(week["repos"][0], name="repo-%d" % i, readme="R" * 6000, commits_capped=False,
+                          commits=[dict(week["repos"][0]["commits"][0], subject="s" * 70)] * 40, commit_count=40)
+                     for i in range(7)]
+    full = compose(week, "")
+    check("with room to spare the person's list keeps every commit",
+          ("more" in full.split("Digest for an assistant")[0], len(full) <= ISSUE_LIMIT), (False, True))
+    odd = json.loads(json.dumps(digest))
+    odd["repos"][0]["description"] = "```json"
+    odd["repos"][0]["commits"][0]["subject"] = "Remove the stray </details> from the FAQ " + "x" * 300
+    odd["repos"][0]["releases"] = [{"tag": "v1", "name": "Fold the log into a <details> block",
+                                    "published_at": "2026-09-20T00:00:00Z", "body": "</details>", "url": "u"}]
+    for drafts in ("", "1. a post"):
+        body = compose(odd, drafts)
+        fences = [line for line in body.split("\n") if line.startswith("```")]
+        parsed = True
+        if not drafts:
+            try:
+                json.loads(body.split("\n```json\n", 1)[1].split("\n```", 1)[0])
+            except ValueError:
+                parsed = False
+        check("tags and fences inside commit text cannot break the issue (%s)" % ("drafts" if drafts else "no drafts"),
+              (body.count("<details>"), body.count("</details>"), len(fences) % 2, parsed),
+              (2 if not drafts else 1, 2 if not drafts else 1, 0, True))
+    long_line = render(odd).split("\n")
+    check("a long commit subject stays on one line, shortened with an ellipsis",
+          [line for line in long_line if "stray" in line][0].endswith("x..."), True)
+    unclosed = compose(digest, "```x-post\nA post the model never closed")
+    check("drafts that leave a fence open are closed before the list",
+          sum(1 for line in unclosed.split("\n") if line.startswith("```")) % 2, 0)
+    cut = compose(digest, "```x-post\n" + "word " * 2000 + "\n```", limit=5000)
+    check("drafts cut to fit never leave a code fence open",
+          sum(1 for line in cut.split("\n") if line.startswith("```")) % 2, 0)
     tiny = compose(busy, "", limit=3000)
     check("a digest that cannot fit is left out and the note says how to get it",
           ("```json" in tiny, "too large to include" in tiny, read_marker(tiny) == busy["state"]),
@@ -982,6 +1062,10 @@ def selftest():
           (True, True))
     tail = check_drafts(block("x-post", "word #ros2"), platforms)
     check("a flagged block at the very end stays put on a re-run", check_drafts(tail, platforms), tail)
+    quoted = block("reddit-body", "Our checker printed this:\n> 2 hashtags: the rules allow 0.\nThat is how it works.")
+    check("a flag quoted inside a post is left alone", check_drafts(quoted + "\n", platforms), quoted + "\n")
+    after_code = block("python", "print(1)") + "\n> Over the limit: 1 of 280 characters. Trim before posting.\n"
+    check("a flag-like line after a non-post block is left alone", check_drafts(after_code, platforms), after_code)
     two = check_drafts(block("x-post", "a" * 300 + " #one"), platforms)
     check("every problem gets its own line", (two.count("\n> "), two.endswith("allow 0.")), (2, True))
 
@@ -1042,7 +1126,7 @@ def main(argv=None):
     github = GitHub(token_from_env())
 
     if args.command == "since":
-        moment, reason = resolve_since(config, fetch_draft_issues(github, config, 1))
+        moment, reason = resolve_since(config, fetch_draft_issues(github, config))
         print("%s  (%s)" % (format_time(moment), reason))
         return 0
 
