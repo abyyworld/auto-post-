@@ -9,8 +9,8 @@ This is the only vendor specific file in the repository. Its contract is three l
 
     read rules.md and config.json, read the digest, print the drafts
 
-To move to a different provider, reimplement that contract in this one file. Nothing else
-changes.
+To move to a different provider, reimplement that contract in this file, then change the
+secret and the package named in the workflow's "Write the drafts" step. Nothing else changes.
 
     pip install anthropic
     export ANTHROPIC_API_KEY=...

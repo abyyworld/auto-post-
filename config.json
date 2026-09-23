@@ -146,6 +146,7 @@
         "use": "rarely: milestones only",
         "max_per_run": 1,
         "max_chars": 3000,
+        "comment_max_chars": 1250,
         "first_line_chars": 140,
         "target_words": [
           60,

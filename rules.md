@@ -83,6 +83,9 @@ Taken from how the README, the site and the LinkedIn profile are already written
   question the work leaves.
 - A question is fine when it is the actual research question. Engagement bait is not:
   "Thoughts?", "Agree?", "Drop a comment", "Like if".
+- No "it's not X, it's Y" contrasts in any form ("isn't X. It's Y.", "not X but Y", "less X,
+  more Y", "X. Not Y."). Say the result directly. LinkedIn demotes the pattern as AI-style, and
+  it reads that way everywhere.
 - No em dashes. No emoji. None of: excited, thrilled, proud to announce, humbled, game changer,
   revolutionary, cutting edge, delve, leverage, unlock, journey, 10x, "here's the thing",
   "let that sink in", "big news".
@@ -100,6 +103,8 @@ live under `posts.platforms` in `config.json`; read the `use` line of each befor
 - When `link_in_reply` is true the main post carries the result and the media, and the link goes
   in a reply. X says links are no longer held back, but a post that leads with a link still gets
   far less engagement than one that leads with the result. Write that reply too.
+- A launch is the exception: the product or repository link goes in the main post, beside a
+  short screen recording, and the owner pins that post. The reply then carries the concrete ask.
 - File names count as links on X: `scan.py` or `README.md` costs 23 characters. Name a file only
   when it matters; `scan.py check` counts it the way X does.
 - Suggest one thing to attach, following `x.media`: a plot or a clip that is already in the
@@ -133,7 +138,8 @@ in `reddit.subreddits` fits it. At most `reddit.max_per_run`. Never a subreddit 
 **LinkedIn, milestones only.** A paper submitted or accepted, a release, a new project with a
 headline result, a launch, or a role change that `config.json` facts state. At most
 `linkedin.max_per_run`. The first `first_line_chars` characters carry the result. Handle the
-link as `linkedin.links` says. Otherwise `LinkedIn: skip`.
+link as `linkedin.links` says; when it goes in a first comment, write that comment too, in the
+`linkedin-comment` block. Otherwise `LinkedIn: skip`.
 
 **Asking for support.** Only for a launch, and only as a concrete ask that fits the product:
 "try it and tell me which boards are missing", not "please like and share". Never ask for votes
@@ -145,6 +151,10 @@ Markdown, because it lands in a GitHub issue. Put every post in its own fenced b
 a copy button, and use the block names below exactly: `scan.py check` measures each block
 against its platform's limits in `config.json` and flags any that break them. Nothing outside
 this shape: no preamble, no closing summary, no offer to help further.
+
+If you can run commands, write the drafts to a file, run `python3 scan.py check <file>`, fix
+every block it flags, and output the checked text. If you cannot, whatever ran you checks them
+afterwards; the scheduled workflow always does.
 
 ````
 ## 1. <a few words naming the result>
@@ -160,7 +170,7 @@ this shape: no preamble, no closing summary, no offer to help further.
 <second post of the thread, only if there is one>
 ```
 ```x-reply
-<reply carrying the link>
+<reply carrying the link; on a launch, the concrete ask instead>
 ```
 **Attach:** <the file in the repository, or what to capture>
 
@@ -184,6 +194,9 @@ Rewrite this in your own words before posting.
 ```linkedin
 <the post>
 ```
+```linkedin-comment
+<the first comment carrying the link, only when the link is not in the post>
+```
 (or the single line `LinkedIn: skip`)
 
 **Check before posting**
@@ -205,5 +218,6 @@ procedure changes here. Changing behaviour in either place should not require to
 
 - 2026-09-22: created. X first, LinkedIn for milestones only, links in the reply.
 - 2026-09-23: Reddit and Instagram added as occasional platforms, with a checked list of
-  subreddits. X link advice reworded after X said links are no longer held back. Bluesky,
-  Threads and Mastodon dropped: not used.
+  subreddits. X link advice reworded after X said links are no longer held back, with a launch
+  exception. LinkedIn first-comment block added. "It's not X, it's Y" banned. Drafts are run
+  through `scan.py check` by whoever can. Bluesky, Threads and Mastodon dropped: not used.

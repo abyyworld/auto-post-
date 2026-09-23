@@ -1,14 +1,16 @@
 # Post drafts, three times a week.
 #
 # Runs on GitHub's infrastructure rather than any AI vendor's, so the schedule survives
-# switching model providers. Swapping provider means editing draft.py, not this file.
+# switching model providers. Swapping provider means replacing draft.py, plus the secret and
+# the package named in the "Write the drafts" step below.
 #
 # Setup, once:
 #   Settings > Secrets and variables > Actions > New repository secret
 #   Name: ANTHROPIC_API_KEY
 #
-# Without the secret the job still runs and still opens the issue, carrying the list of
-# what changed alone. That half is deterministic and needs no model.
+# Without the secret the job still runs and still opens the issue, carrying what changed and
+# the digest an assistant needs to write the drafts. That half is deterministic and needs no
+# model.
 #
 # Optional: a SCAN_TOKEN secret (a fine-grained token with read-only Contents and Metadata)
 # lets scan.py see private repositories, but only once scan.public_only is false in

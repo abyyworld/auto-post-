@@ -430,17 +430,44 @@ def render(digest):
     return "\n".join(lines).rstrip() + "\n"
 
 
+def for_assistant(digest, limit):
+    """The digest as an assistant needs it, without the state marker, as JSON under limit.
+
+    README excerpts are the bulk, so they shrink first. The result always parses.
+    """
+    for readme_chars in (None, 2000, 500, 0):
+        copy = json.loads(json.dumps(digest))
+        copy.pop("state", None)
+        for repo in copy["repos"]:
+            if readme_chars is not None:
+                repo["readme"] = clip(repo["readme"], readme_chars) if readme_chars else "[left out to fit]"
+        text = json.dumps(copy, indent=1, ensure_ascii=False)
+        if len(text) <= limit:
+            return text
+    copy["previous_drafts"] = []
+    copy["repos"] = [dict(repo, commits=repo["commits"][:5]) for repo in copy["repos"]]
+    return json.dumps(copy, ensure_ascii=False)
+
+
 def compose(digest, drafts=None, limit=ISSUE_LIMIT):
-    """The issue body. The marker goes first so no amount of trimming can cut it off."""
+    """The issue body. The marker goes first so no amount of trimming can cut it off.
+
+    Without drafts, the body carries the digest itself, so any assistant given it with
+    rules.md and config.json has every fact the rules require a claim to trace to.
+    """
     marker = write_marker(digest["state"])
+    changes = "<details><summary>What changed</summary>\n\n%s\n</details>" % render(digest).strip()
     if drafts and drafts.strip():
-        head = drafts.strip()
+        parts = [marker, drafts.strip(), changes]
     else:
-        head = ("No drafts this time: no model was available to write them, so this is the "
-                "list of changes alone. Paste it into any assistant together with rules.md "
-                "to get the drafts.")
-    tail = "<details><summary>What changed</summary>\n\n%s\n</details>" % render(digest).strip()
-    body = "%s\n\n%s\n\n%s\n" % (marker, head, tail)
+        note = ("No drafts this time: no model was available to write them. To get them, give any "
+                "assistant rules.md, config.json and the digest below, and ask it to follow rules.md.")
+        room = limit - len(marker) - len(note) - len(changes) - 200
+        digest_json = for_assistant(digest, max(room, 1000))
+        parts = [marker, note, changes,
+                 "<details><summary>Digest for an assistant</summary>\n\n```json\n%s\n```\n</details>"
+                 % digest_json]
+    body = "\n\n".join(parts) + "\n"
     if len(body) > limit:
         body = body[:limit - len(TRUNCATED)].rstrip() + TRUNCATED + "\n"
     return body
@@ -542,6 +569,7 @@ BLOCKS = {
     "reddit-body": ("reddit", "body_max_chars", len),
     "instagram": ("instagram", "caption_max_chars", len),
     "linkedin": ("linkedin", "max_chars", len),
+    "linkedin-comment": ("linkedin", "comment_max_chars", len),
 }
 
 
@@ -762,7 +790,19 @@ def selftest():
     check("render carries no em dash", "\u2014" in text, False)
     body = compose(digest, "1. a post")
     check("the issue body starts with the marker", read_marker(body.split("\n", 1)[0]), digest["state"])
-    check("no drafts still yields a usable body", "rules.md" in compose(digest, ""), True)
+    bare = compose(digest, "")
+    embedded = json.loads(bare.split("```json\n", 1)[1].split("\n```", 1)[0])
+    check("no drafts: the body carries the digest an assistant needs, minus the marker",
+          ("rules.md" in bare and "config.json" in bare, embedded["repos"][0]["commits"][0]["body"],
+           "state" in embedded), (True, "Measured over 10 runs.", False))
+    huge = json.loads(json.dumps(digest))
+    for repo in huge["repos"]:
+        repo["readme"] = "R" * 50000
+    squeezed = compose(huge, "", limit=20000)
+    squeezed_json = json.loads(squeezed.split("```json\n", 1)[1].split("\n```", 1)[0])
+    check("an oversized digest shrinks its readmes, stays valid JSON and keeps the marker",
+          (len(squeezed) <= 20001, read_marker(squeezed) == huge["state"],
+           len(squeezed_json["repos"][0]["readme"]) < 50000), (True, True, True))
     short = compose(digest, "x" * 5000, limit=1000)
     check("an oversized body is trimmed but keeps its marker",
           (len(short) <= 1001, read_marker(short) == digest["state"]), (True, True))
@@ -781,6 +821,7 @@ def selftest():
         ("https://github.com/abyyworld/vla-evals", 23), ("config.json", 11), ("plot.png", 8),
         ("sim.mp4", 7), ("rclpy.spin", 10), ("v0.1.0", 6), ("e.g. this", 9),
         ("./policy-evals run", 18), ("3.2 ms \u2192 1.1 ms", 16), ("Isaac Lab.", 10),
+        ("see configure.ac", 27), ("see foo.onion", 27),
     ]
     check("counts agree with twitter-text", [(t, x_length(t)) for t, _ in measured], measured)
     platforms = {
@@ -802,6 +843,9 @@ def selftest():
           "Over the limit" in check_drafts(block("linkedin", "a" * 900), platforms), False)
     check("an over-long LinkedIn post is flagged",
           "3001 of 3000" in check_drafts(block("linkedin", "a" * 3001), platforms), True)
+    platforms["linkedin"]["comment_max_chars"] = 1250
+    check("a LinkedIn first comment is measured against the comment limit",
+          "1251 of 1250" in check_drafts(block("linkedin-comment", "a" * 1251), platforms), True)
     check("a Reddit title is measured on its own",
           ("301 of 300" in check_drafts(block("reddit-title", "t" * 301), platforms),
            "Over" in check_drafts(block("reddit-body", "b" * 999), platforms)), (True, False))

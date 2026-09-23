@@ -47,8 +47,8 @@ python3 scan.py scan --json --out digest.json    # the same, for draft.py or an 
 python3 scan.py scan --since 2026-09-15T00:00:00Z
 python3 draft.py digest.json --dry-run           # the exact prompt, no key needed
 python3 draft.py digest.json > raw.md            # needs anthropic and ANTHROPIC_API_KEY
-python3 scan.py check raw.md                     # flags posts over their platform's limits, drops em dashes
-python3 scan.py compose digest.json --drafts raw.md   # the issue body
+python3 scan.py check raw.md > drafts.md         # flags posts over their platform's limits, drops em dashes
+python3 scan.py compose digest.json --drafts drafts.md   # the issue body, from the checked drafts
 python3 scan.py selftest                         # the checks behind all of the above
 ```
 
@@ -77,8 +77,9 @@ for a small run.
 ## Switching the schedule on
 
 1. Add a repository secret named `ANTHROPIC_API_KEY` under Settings, Secrets and variables,
-   Actions. Without it the issue still arrives three times a week, carrying the list of what
-   changed; paste that and `rules.md` into any assistant to get the drafts.
+   Actions. Without it the issue still arrives three times a week, carrying what changed and
+   the digest itself; give that digest, `rules.md` and `config.json` to any assistant to get
+   the drafts.
 2. GitHub only runs scheduled workflows from the **default branch**. Keep the workflow there.
    `workflow_dispatch` in the Actions tab runs it by hand at any time.
 
@@ -90,8 +91,9 @@ push on the phone with the GitHub app.
 With no API key and no workflow, an assistant that can run Python does the same job:
 
 1. `python3 scan.py scan --json --out digest.json`
-2. Follow `rules.md` against that digest and write the drafts.
-3. Optionally open the issue from `python3 scan.py compose digest.json --drafts <drafts file>`
+2. Follow `rules.md` against that digest and write the drafts to a file.
+3. `python3 scan.py check <drafts file> > drafts.md`, and fix every block it flags.
+4. Optionally open the issue from `python3 scan.py compose digest.json --drafts drafts.md`
    with the label in `config.json`, so the next run starts where this one stopped. Skip this and
    the next run simply covers the same window again.
 
@@ -100,7 +102,8 @@ With no API key and no workflow, an assistant that can run Python does the same 
 Nothing here depends on one vendor. The rules are Markdown, the config is JSON, the scanner is
 standard library Python. Only `draft.py` calls a model, through the Anthropic SDK. To switch
 provider, replace that one file; its contract is to read `rules.md`, `config.json` and the
-digest and print the drafts on stdout.
+digest and print the drafts on stdout. Then change the two provider lines in the workflow's
+"Write the drafts" step: the secret it passes in and the package it installs.
 
 | Option | Where it runs | Portability |
 | --- | --- | --- |
