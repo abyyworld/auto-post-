@@ -23,9 +23,11 @@ Standard library only, so any machine with Python 3 can run it.
 How "new" is decided. Every drafts issue carries a hidden marker with the time of its
 scan and the head commit of each repository's default branch. The next scan compares
 each repository from that head to the current one, so a branch merged days after its
-commits were written still shows up. With no marker to go on (the first run, or a head
-that was rewritten away) it falls back to commits dated inside the window. The window
-never starts before scan.start_from in config.json.
+commits were written still shows up. A history rewrite is seen through: copies of commits
+already reported are recognised by author date and tree. With no recorded head (the first
+run) a repository created since scan.start_from is read whole, and any other gives the
+commits authored inside the window, since when a commit was pushed is not visible then.
+The window never starts before scan.start_from in config.json.
 
 No state is committed anywhere: the issues are the log.
 
