@@ -393,9 +393,12 @@ def new_commits(github, repo, since, previous, whole_history=False):
         commits = github.get_all(path, {"sha": branch}, max_pages=WHOLE_PAGES)
         complete, method = len(commits) < PAGE * WHOLE_PAGES, "whole history"
     else:
-        commits = github.get(path, {"sha": branch, "since": format_time(since), "per_page": PAGE},
-                             missing=[]) or []
-        complete, method = len(commits) < PAGE, "dated in window"
+        listed = github.get(path, {"sha": branch, "since": format_time(since), "per_page": PAGE},
+                            missing=[]) or []
+        # GitHub's since goes by committer date, which a rebase or rewrite resets; the author
+        # date says when the work was done, so older work re-committed later stays out.
+        commits = [c for c in listed if authored(c) and authored(c) >= since]
+        complete, method = len(listed) < PAGE, "dated in window"
     head = commits[0]["sha"] if commits else current_head(github, repo)
     return commits, head, method, len(commits), complete
 
@@ -1165,6 +1168,15 @@ def selftest():
     check("a new repository with more than a page of history is counted in full",
           ((deep["repos"] or [{}])[0].get("commit_count"), (deep["repos"] or [{}])[0].get("count_complete")),
           (150, True))
+
+    recommitted = dict(commit("o", "Old work, rebased later", date="2026-08-20T09:00:00Z"))
+    recommitted["commit"]["committer"] = {"name": "Me", "date": "2026-09-26T09:00:00Z"}
+    first_run = build_digest(world({"/repos/me/proj/commits": [commit("n", "New work", date="2026-09-26T10:00:00Z"),
+                                                                recommitted]},
+                                   [repo("proj", pushed="2026-09-26T10:00:00Z")], []),
+                             config, now=t("2026-09-28T07:34:00Z"))
+    check("on a first run, work authored before the window but re-committed inside it stays out",
+          subjects(first_run), ["New work"])
 
     markerless = dict(issue("2026-09-27T07:00:00Z"), body="edited by hand")
     check("an issue whose marker was edited away does not hide the heads before it",
